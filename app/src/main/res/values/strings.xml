@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">NotiStack for LINE</string>
+    <string name="service_name">NotiStack 通知增強服務</string>
+    <string name="permission_required_title">需要通知存取權限</string>
+    <string name="permission_required_desc">NotiStack 必須存取通知以解析 LINE 訊息並提供智慧堆疊、已讀同步與個別鈴聲管理。本 App 絕不上傳任何訊息至網路。</string>
+    <string name="grant_permission">前往授權</string>
+    <string name="service_status_connected">通知監聽服務運作中</string>
+    <string name="service_status_disconnected">通知監聽服務未啟動</string>
+    <string name="filter_line_only">僅顯示 LINE 通知</string>
+    <string name="clear_logs">清空日誌</string>
+    <string name="test_notification">發送模擬通知測試</string>
+</resources>

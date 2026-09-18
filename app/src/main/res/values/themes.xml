@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.NotiStack" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/purple_40</item>
+    </style>
+</resources>
