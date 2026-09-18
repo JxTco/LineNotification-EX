@@ -56,18 +56,55 @@ object NotificationParser {
     }
 
     /**
-     * 從 StatusBarNotification 建立移除事件記錄
+     * 從 SBN 提取聊天室關鍵識別資訊與訊息內容
      */
-    fun parseRemoved(sbn: StatusBarNotification, reason: Int): CapturedNotification {
-        val base = parsePosted(sbn)
-        return base.copy(
-            eventType = EventType.REMOVED,
-            removeReason = reason
-        )
-    }
+    fun extractChatInfo(sbn: StatusBarNotification): ParsedChatInfo? {
+        val notification = sbn.notification
+        val extras = notification.extras ?: return null
 
-    fun isTargetPackage(packageName: String): Boolean {
-        return packageName == LINE_PACKAGE_NAME || packageName == "com.notistack.line"
+        val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim() ?: return null
+        val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim() ?: ""
+        val conversationTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
+
+        val userId = extractUserId(sbn.user)
+        val accountId = "user_$userId"
+
+        val isGroup: Boolean
+        val chatTitle: String
+        val senderName: String
+
+        if (!conversationTitle.isNullOrEmpty()) {
+            // 群組聊天：conversationTitle 為群組名，rawTitle 為發言者
+            isGroup = true
+            chatTitle = conversationTitle
+            senderName = rawTitle
+        } else {
+            // 個人聊天或無 conversationTitle
+            isGroup = false
+            chatTitle = rawTitle
+            senderName = rawTitle
+        }
+
+        val chatKey = "${accountId}_${chatTitle.replace(" ", "_")}"
+
+        var hasRemoteInput = false
+        notification.actions?.forEach { action ->
+            if (!action.remoteInputs.isNullOrEmpty()) {
+                hasRemoteInput = true
+            }
+        }
+
+        return ParsedChatInfo(
+            accountId = accountId,
+            chatKey = chatKey,
+            chatTitle = chatTitle,
+            senderName = senderName,
+            content = rawText,
+            isGroup = isGroup,
+            timestamp = sbn.postTime,
+            contentIntent = notification.contentIntent,
+            hasRemoteInput = hasRemoteInput
+        )
     }
 
     /**
@@ -104,4 +141,35 @@ object NotificationParser {
             else -> "未知原因 ($reason)"
         }
     }
+
+    /**
+     * 從 StatusBarNotification 建立移除事件記錄
+     */
+    fun parseRemoved(sbn: StatusBarNotification, reason: Int): CapturedNotification {
+        val base = parsePosted(sbn)
+        return base.copy(
+            eventType = EventType.REMOVED,
+            removeReason = reason
+        )
+    }
+
+    fun isTargetPackage(packageName: String): Boolean {
+        return packageName == LINE_PACKAGE_NAME || packageName == "com.notistack.line"
+    }
 }
+
+/**
+ * 結構化聊天室訊息資料
+ */
+data class ParsedChatInfo(
+    val accountId: String,
+    val chatKey: String,
+    val chatTitle: String,
+    val senderName: String,
+    val content: String,
+    val isGroup: Boolean,
+    val timestamp: Long,
+    val contentIntent: android.app.PendingIntent?,
+    val hasRemoteInput: Boolean
+)
+
