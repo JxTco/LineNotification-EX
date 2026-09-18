@@ -14,6 +14,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.math.abs
+
+data class SaveMessageResult(
+    val chat: ChatConversation,
+    val isNewMessage: Boolean
+)
 
 class NotiStackDatabase private constructor(context: Context) :
     SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION) {
@@ -87,7 +93,7 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
-     * 儲存收到的訊息並更新聊天室狀態
+     * 儲存收到的訊息並更新聊天室狀態 (內建資料庫層級去重機制)
      */
     suspend fun saveIncomingMessage(
         chatKey: String,
@@ -98,10 +104,52 @@ class NotiStackDatabase private constructor(context: Context) :
         content: String,
         timestamp: Long,
         rawKey: String?
-    ): ChatConversation = mutex.withLock {
+    ): SaveMessageResult = mutex.withLock {
         val db = writableDatabase
 
-        // 1. 插入訊息記錄
+        // 1. 去重檢查：10 秒內相同聊天室、相同發言者、相同內容的訊息視為同一則實際訊息
+        val dedupQuery = """
+            SELECT id, timestamp FROM $TABLE_MESSAGES 
+            WHERE chat_key = ? AND sender_name = ? AND content = ? 
+            ORDER BY timestamp DESC LIMIT 1
+        """.trimIndent()
+
+        var isDuplicate = false
+        db.rawQuery(dedupQuery, arrayOf(chatKey, senderName, content)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                val existingTime = cursor.getLong(1)
+                if (abs(timestamp - existingTime) < 10000L) {
+                    isDuplicate = true
+                }
+            }
+        }
+
+        // 2. 查詢現有聊天室狀態
+        var isStackEnabled = true
+        var currentUnread = 0
+        db.rawQuery("SELECT is_stack_enabled, unread_count FROM $TABLE_CHATS WHERE chat_key = ?", arrayOf(chatKey)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                isStackEnabled = cursor.getInt(0) == 1
+                currentUnread = cursor.getInt(1)
+            }
+        }
+
+        if (isDuplicate) {
+            // 重複事件：不插入新訊息，不累計未讀數，直接回傳當前狀態
+            val existingChat = ChatConversation(
+                chatKey = chatKey,
+                accountId = accountId,
+                title = chatTitle,
+                isGroup = isGroup,
+                isStackEnabled = isStackEnabled,
+                lastMessageTime = timestamp,
+                lastMessageContent = content,
+                unreadCount = currentUnread
+            )
+            return@withLock SaveMessageResult(existingChat, isNewMessage = false)
+        }
+
+        // 3. 真正的新訊息：插入訊息表記錄
         val msgValues = ContentValues().apply {
             put("chat_key", chatKey)
             put("sender_name", senderName)
@@ -112,17 +160,8 @@ class NotiStackDatabase private constructor(context: Context) :
         }
         db.insert(TABLE_MESSAGES, null, msgValues)
 
-        // 2. 查詢現有聊天室
-        var isStackEnabled = true
-        var currentUnread = 0
-        db.rawQuery("SELECT is_stack_enabled, unread_count FROM $TABLE_CHATS WHERE chat_key = ?", arrayOf(chatKey)).use { cursor ->
-            if (cursor.moveToFirst()) {
-                isStackEnabled = cursor.getInt(0) == 1
-                currentUnread = cursor.getInt(1)
-            }
-        }
-
-        // 3. Upsert 聊天室
+        // 4. 更新聊天室表
+        val newUnread = currentUnread + 1
         val chatValues = ContentValues().apply {
             put("chat_key", chatKey)
             put("account_id", accountId)
@@ -131,13 +170,13 @@ class NotiStackDatabase private constructor(context: Context) :
             put("is_stack_enabled", if (isStackEnabled) 1 else 0)
             put("last_message_time", timestamp)
             put("last_message_content", content)
-            put("unread_count", currentUnread + 1)
+            put("unread_count", newUnread)
         }
         db.insertWithOnConflict(TABLE_CHATS, null, chatValues, SQLiteDatabase.CONFLICT_REPLACE)
 
         refreshChatsInternal(db)
 
-        ChatConversation(
+        val updatedChat = ChatConversation(
             chatKey = chatKey,
             accountId = accountId,
             title = chatTitle,
@@ -145,8 +184,9 @@ class NotiStackDatabase private constructor(context: Context) :
             isStackEnabled = isStackEnabled,
             lastMessageTime = timestamp,
             lastMessageContent = content,
-            unreadCount = currentUnread + 1
+            unreadCount = newUnread
         )
+        SaveMessageResult(updatedChat, isNewMessage = true)
     }
 
     /**
@@ -180,7 +220,6 @@ class NotiStackDatabase private constructor(context: Context) :
                 )
             }
         }
-        // 反轉為時間由舊到新
         list.reversed()
     }
 
@@ -218,7 +257,7 @@ class NotiStackDatabase private constructor(context: Context) :
             if (cursor.moveToFirst()) {
                 cursor.getInt(0) == 1
             } else {
-                true // 預設開啟
+                true
             }
         }
     }

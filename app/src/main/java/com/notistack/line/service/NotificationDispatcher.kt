@@ -10,11 +10,15 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import com.notistack.line.core.model.ChatConversation
 import com.notistack.line.core.model.ChatMessage
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
 class NotificationDispatcher(private val context: Context) {
 
     private val notificationManager = NotificationManagerCompat.from(context)
+
+    // 快取個別聊天室原生有效的直達 Intent (確保群組與個人直達 Intent 不丟失)
+    private val chatContentIntents = ConcurrentHashMap<String, PendingIntent>()
 
     companion object {
         const val STACK_CHANNEL_ID = "notistack_stacked_channel"
@@ -55,11 +59,13 @@ class NotificationDispatcher(private val context: Context) {
      * @param chat 聊天室基本資訊
      * @param messages 該聊天室歷史未清除訊息清單 (時間由舊到新)
      * @param contentIntent 原生 LINE 的點擊 Intent (點擊可直接跳轉 LINE 聊天室)
+     * @param isNewMessage 是否為新訊息 (若為既有訊息更新，則靜默更新不重複震動鈴響)
      */
     fun dispatchStackedNotification(
         chat: ChatConversation,
         messages: List<ChatMessage>,
-        contentIntent: PendingIntent?
+        contentIntent: PendingIntent?,
+        isNewMessage: Boolean = true
     ) {
         if (messages.isEmpty()) return
 
@@ -104,11 +110,15 @@ class NotificationDispatcher(private val context: Context) {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setAutoCancel(true)
-            .setOnlyAlertOnce(false)
+            .setOnlyAlertOnce(!isNewMessage)
 
-        // 綁定原生 LINE 的點擊行為 (直達聊天室)
+        // 儲存並綁定直達該聊天室的原生 PendingIntent
         if (contentIntent != null) {
-            builder.setContentIntent(contentIntent)
+            chatContentIntents[chat.chatKey] = contentIntent
+        }
+        val intentToUse = contentIntent ?: chatContentIntents[chat.chatKey]
+        if (intentToUse != null) {
+            builder.setContentIntent(intentToUse)
         }
 
         notificationManager.notify(notificationId, builder.build())
@@ -120,6 +130,7 @@ class NotificationDispatcher(private val context: Context) {
     fun cancelStackedNotification(chatKey: String) {
         val notificationId = getNotificationId(chatKey)
         notificationManager.cancel(notificationId)
+        chatContentIntents.remove(chatKey)
     }
 
     fun getNotificationId(chatKey: String): Int {

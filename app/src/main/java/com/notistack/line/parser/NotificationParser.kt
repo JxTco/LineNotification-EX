@@ -1,6 +1,7 @@
 package com.notistack.line.parser
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.os.Build
 import android.os.UserHandle
 import android.service.notification.StatusBarNotification
@@ -56,36 +57,106 @@ object NotificationParser {
     }
 
     /**
+     * 從 StatusBarNotification 建立移除事件記錄
+     */
+    fun parseRemoved(sbn: StatusBarNotification, reason: Int): CapturedNotification {
+        val base = parsePosted(sbn)
+        return base.copy(
+            eventType = EventType.REMOVED,
+            removeReason = reason
+        )
+    }
+
+    /**
+     * 判定是否為 LINE 原生通知 (嚴格限定官方 LINE package，絕不包含自身套件)
+     */
+    fun isTargetPackage(packageName: String): Boolean {
+        return packageName == LINE_PACKAGE_NAME
+    }
+
+    /**
+     * 判定是否為 Android 群組摘要通知 (Group Summary)
+     */
+    fun isGroupSummary(sbn: StatusBarNotification): Boolean {
+        return (sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0
+    }
+
+    /**
      * 從 SBN 提取聊天室關鍵識別資訊與訊息內容
+     * 精確辨識個人聊天室 (DM) 與群組聊天室 (Group)，保證同一發送人在不同聊天室絕不混淆
      */
     fun extractChatInfo(sbn: StatusBarNotification): ParsedChatInfo? {
         val notification = sbn.notification
         val extras = notification.extras ?: return null
 
         val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim() ?: return null
-        val rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim() ?: ""
+        var rawText = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim() ?: ""
         val conversationTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
+        val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim()
 
         val userId = extractUserId(sbn.user)
         val accountId = "user_$userId"
+
+        val shortcutId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            notification.shortcutId?.trim()
+        } else null
 
         val isGroup: Boolean
         val chatTitle: String
         val senderName: String
 
+        // 規則 1: 具有明確的 conversationTitle (標準群組對話)
         if (!conversationTitle.isNullOrEmpty()) {
-            // 群組聊天：conversationTitle 為群組名，rawTitle 為發言者
             isGroup = true
             chatTitle = conversationTitle
             senderName = rawTitle
-        } else {
-            // 個人聊天或無 conversationTitle
-            isGroup = false
-            chatTitle = rawTitle
+        }
+        // 規則 2: subText 包含群組名稱 (LINE 常見群組模式：title 是發送人，subText 是群組名)
+        else if (!subText.isNullOrEmpty() && subText != rawTitle) {
+            isGroup = true
+            chatTitle = subText
             senderName = rawTitle
         }
+        // 規則 3: title 包含括號格式，例如 "工作群組 (小明)" 或 "工作群組（小明）" 或 "[工作群組] 小明"
+        else if (rawTitle.contains(" (") || rawTitle.contains("（") || (rawTitle.startsWith("[") && rawTitle.contains("]"))) {
+            val parenMatch = Regex("""^(.*?)[（\(](.*?)[）\)]\s*$""").find(rawTitle)
+                ?: Regex("""^\[(.*?)\]\s*(.*?)$""").find(rawTitle)
 
-        val chatKey = "${accountId}_${chatTitle.replace(" ", "_")}"
+            if (parenMatch != null) {
+                isGroup = true
+                chatTitle = parenMatch.groupValues[1].trim()
+                senderName = parenMatch.groupValues[2].trim()
+            } else {
+                chatTitle = rawTitle
+                senderName = rawTitle
+                isGroup = false
+            }
+        }
+        // 規則 4: title 是群組名，而內文以 "發送人: 訊息" 開頭
+        else {
+            val textPrefixMatch = Regex("""^([^:\n]{1,30})[:：]\s*(.*)$""").find(rawText)
+            if (textPrefixMatch != null) {
+                isGroup = true
+                chatTitle = rawTitle
+                senderName = textPrefixMatch.groupValues[1].trim()
+                rawText = textPrefixMatch.groupValues[2].trim()
+            } else {
+                // 個人聊天室 (1-on-1 Direct Message)
+                isGroup = false
+                chatTitle = rawTitle
+                senderName = rawTitle
+            }
+        }
+
+        // 建立絕不碰撞的 chatKey (個人聊天室與群組聊天室使用不同前綴)
+        val sanitizedTitle = chatTitle.replace(" ", "_").replace("/", "_")
+        val chatKey = if (!shortcutId.isNullOrBlank()) {
+            "${accountId}_sc_${shortcutId}"
+        } else if (isGroup) {
+            "${accountId}_grp_${sanitizedTitle}"
+        } else {
+            "${accountId}_dm_${sanitizedTitle}"
+        }
 
         var hasRemoteInput = false
         notification.actions?.forEach { action ->
@@ -103,7 +174,8 @@ object NotificationParser {
             isGroup = isGroup,
             timestamp = sbn.postTime,
             contentIntent = notification.contentIntent,
-            hasRemoteInput = hasRemoteInput
+            hasRemoteInput = hasRemoteInput,
+            isGroupSummary = isGroupSummary(sbn)
         )
     }
 
@@ -141,21 +213,6 @@ object NotificationParser {
             else -> "未知原因 ($reason)"
         }
     }
-
-    /**
-     * 從 StatusBarNotification 建立移除事件記錄
-     */
-    fun parseRemoved(sbn: StatusBarNotification, reason: Int): CapturedNotification {
-        val base = parsePosted(sbn)
-        return base.copy(
-            eventType = EventType.REMOVED,
-            removeReason = reason
-        )
-    }
-
-    fun isTargetPackage(packageName: String): Boolean {
-        return packageName == LINE_PACKAGE_NAME || packageName == "com.notistack.line"
-    }
 }
 
 /**
@@ -169,7 +226,7 @@ data class ParsedChatInfo(
     val content: String,
     val isGroup: Boolean,
     val timestamp: Long,
-    val contentIntent: android.app.PendingIntent?,
-    val hasRemoteInput: Boolean
+    val contentIntent: PendingIntent?,
+    val hasRemoteInput: Boolean,
+    val isGroupSummary: Boolean = false
 )
-

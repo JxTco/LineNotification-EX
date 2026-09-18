@@ -687,6 +687,7 @@ fun sendTestNotification(context: Context) {
         .setPriority(NotificationCompat.PRIORITY_HIGH)
         .setAutoCancel(true)
         .addAction(replyAction)
+        .addExtras(Bundle().apply { putBoolean("is_notistack_test", true) })
         .build()
 
     val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
