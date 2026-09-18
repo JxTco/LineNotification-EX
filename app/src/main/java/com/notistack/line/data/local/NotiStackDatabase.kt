@@ -107,18 +107,13 @@ class NotiStackDatabase private constructor(context: Context) :
     ): SaveMessageResult = mutex.withLock {
         val db = writableDatabase
 
-        // 1. 去重檢查：10 秒內相同聊天室、相同發言者、相同內容的訊息視為同一則實際訊息
-        val dedupQuery = """
-            SELECT id, timestamp FROM $TABLE_MESSAGES 
-            WHERE chat_key = ? AND sender_name = ? AND content = ? 
-            ORDER BY timestamp DESC LIMIT 1
-        """.trimIndent()
-
+        // 1. 去重檢查：僅針對完全相同的系統通知事件 (相同的 rawKey 與相同的 timestamp)
+        // 絕不比對文字內容，避免使用者連續發送相同訊息 (例如「吃飯了嗎？」) 時發生誤殺
         var isDuplicate = false
-        db.rawQuery(dedupQuery, arrayOf(chatKey, senderName, content)).use { cursor ->
-            if (cursor.moveToFirst()) {
-                val existingTime = cursor.getLong(1)
-                if (abs(timestamp - existingTime) < 10000L) {
+        if (!rawKey.isNullOrBlank()) {
+            val dedupQuery = "SELECT id FROM $TABLE_MESSAGES WHERE raw_key = ? AND timestamp = ? LIMIT 1"
+            db.rawQuery(dedupQuery, arrayOf(rawKey, timestamp.toString())).use { cursor ->
+                if (cursor.moveToFirst()) {
                     isDuplicate = true
                 }
             }

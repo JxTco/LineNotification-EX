@@ -101,50 +101,82 @@ object NotificationParser {
             notification.shortcutId?.trim()
         } else null
 
-        val isGroup: Boolean
-        val chatTitle: String
-        val senderName: String
+        var isGroup: Boolean = false
+        var chatTitle: String = rawTitle
+        var senderName: String = rawTitle
 
-        // 規則 1: 具有明確的 conversationTitle (標準群組對話)
-        if (!conversationTitle.isNullOrEmpty()) {
-            isGroup = true
-            chatTitle = conversationTitle
-            senderName = rawTitle
+        // 規則 0: 嘗試從 AndroidX MessagingStyle 原生結構解析 (若 LINE 內部採用 MessagingStyle)
+        val messagingStyle = try {
+            androidx.core.app.NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)
+        } catch (e: Exception) {
+            null
         }
-        // 規則 2: subText 包含群組名稱 (LINE 常見群組模式：title 是發送人，subText 是群組名)
-        else if (!subText.isNullOrEmpty() && subText != rawTitle) {
-            isGroup = true
-            chatTitle = subText
-            senderName = rawTitle
-        }
-        // 規則 3: title 包含括號格式，例如 "工作群組 (小明)" 或 "工作群組（小明）" 或 "[工作群組] 小明"
-        else if (rawTitle.contains(" (") || rawTitle.contains("（") || (rawTitle.startsWith("[") && rawTitle.contains("]"))) {
-            val parenMatch = Regex("""^(.*?)[（\(](.*?)[）\)]\s*$""").find(rawTitle)
-                ?: Regex("""^\[(.*?)\]\s*(.*?)$""").find(rawTitle)
 
-            if (parenMatch != null) {
+        if (messagingStyle != null) {
+            val styleGroupTitle = messagingStyle.conversationTitle?.toString()?.trim()
+            val isStyleGroup = messagingStyle.isGroupConversation || !styleGroupTitle.isNullOrEmpty()
+            val latestMessage = messagingStyle.messages.lastOrNull()
+
+            if (latestMessage != null) {
+                val styleSender = latestMessage.person?.name?.toString()?.trim()
+                val styleContent = latestMessage.text?.toString()?.trim()
+                if (!styleContent.isNullOrBlank()) {
+                    rawText = styleContent
+                }
+                if (!styleSender.isNullOrBlank()) {
+                    senderName = styleSender
+                }
+            }
+
+            if (isStyleGroup && !styleGroupTitle.isNullOrEmpty()) {
                 isGroup = true
-                chatTitle = parenMatch.groupValues[1].trim()
-                senderName = parenMatch.groupValues[2].trim()
-            } else {
-                chatTitle = rawTitle
-                senderName = rawTitle
-                isGroup = false
+                chatTitle = styleGroupTitle
             }
         }
-        // 規則 4: title 是群組名，而內文以 "發送人: 訊息" 開頭
-        else {
-            val textPrefixMatch = Regex("""^([^:\n]{1,30})[:：]\s*(.*)$""").find(rawText)
-            if (textPrefixMatch != null) {
+
+        // 若 MessagingStyle 未能明確判定群組，依序執行文字與欄位特徵判定
+        if (!isGroup) {
+            // 規則 1: 具有明確的 conversationTitle (標準群組對話)
+            if (!conversationTitle.isNullOrEmpty()) {
                 isGroup = true
-                chatTitle = rawTitle
-                senderName = textPrefixMatch.groupValues[1].trim()
-                rawText = textPrefixMatch.groupValues[2].trim()
-            } else {
-                // 個人聊天室 (1-on-1 Direct Message)
-                isGroup = false
-                chatTitle = rawTitle
+                chatTitle = conversationTitle
                 senderName = rawTitle
+            }
+            // 規則 2: subText 包含群組名稱 (LINE 常見群組模式：title 是發送人，subText 是群組名)
+            else if (!subText.isNullOrEmpty() && subText != rawTitle) {
+                isGroup = true
+                chatTitle = subText
+                senderName = rawTitle
+            }
+            // 規則 3: title 包含括號格式，例如 "工作群組 (小明)" 或 "工作群組（小明）" 或 "[工作群組] 小明"
+            else if (rawTitle.contains(" (") || rawTitle.contains("（") || (rawTitle.startsWith("[") && rawTitle.contains("]"))) {
+                val parenMatch = Regex("""^(.*?)[（\(](.*?)[）\)]\s*$""").find(rawTitle)
+                    ?: Regex("""^\[(.*?)\]\s*(.*?)$""").find(rawTitle)
+
+                if (parenMatch != null) {
+                    isGroup = true
+                    chatTitle = parenMatch.groupValues[1].trim()
+                    senderName = parenMatch.groupValues[2].trim()
+                } else {
+                    chatTitle = rawTitle
+                    senderName = rawTitle
+                    isGroup = false
+                }
+            }
+            // 規則 4: title 是群組名，而內文以 "發送人: 訊息" 開頭
+            else {
+                val textPrefixMatch = Regex("""^([^:\n]{1,30})[:：]\s*(.*)$""").find(rawText)
+                if (textPrefixMatch != null) {
+                    isGroup = true
+                    chatTitle = rawTitle
+                    senderName = textPrefixMatch.groupValues[1].trim()
+                    rawText = textPrefixMatch.groupValues[2].trim()
+                } else {
+                    // 個人聊天室 (1-on-1 Direct Message)
+                    isGroup = false
+                    chatTitle = rawTitle
+                    senderName = rawTitle
+                }
             }
         }
 

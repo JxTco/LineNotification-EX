@@ -116,13 +116,10 @@ class LineNotificationListenerService : NotificationListenerService() {
         val chatInfo = NotificationParser.extractChatInfo(sbn) ?: return
         if (chatInfo.content.isBlank()) return
 
-        // 去重第 2 層：記憶體滑動時間窗 (8 秒內完全相同的訊息視為系統重複推播或更新)
-        if (MessageDeduplicator.isDuplicate(chatInfo.accountId, chatInfo.chatKey, chatInfo.senderName, chatInfo.content)) {
-            Log.d(TAG, "Duplicate message event ignored by MessageDeduplicator: ${chatInfo.chatKey} - ${chatInfo.content}")
-            // 若在模式 B，雖然訊息不重複計入，但仍確保消除原生通知
-            if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
-                cancelNotification(sbn.key)
-            }
+        // 去重第 2 層：僅比對系統事件層級 (相同 sbn.key 與相同 postTime)
+        // 絕不比對文字內容，保證使用者連續發送相同文字時每一則都能被正常接收
+        if (MessageDeduplicator.isDuplicateSystemEvent(sbn.key, sbn.postTime)) {
+            Log.d(TAG, "Duplicate system callback event ignored: ${sbn.key}")
             return
         }
 
