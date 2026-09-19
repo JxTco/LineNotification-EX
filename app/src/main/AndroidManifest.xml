@@ -33,6 +33,15 @@
             </intent-filter>
         </service>
 
+        <!-- 直接回覆廣播接收器 -->
+        <receiver
+            android:name=".service.ReplyActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.notistack.line.ACTION_DIRECT_REPLY" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

@@ -191,11 +191,22 @@ object NotificationParser {
         }
 
         var hasRemoteInput = false
+        var replyPendingIntent: PendingIntent? = null
+        var remoteInputResultKey: String? = null
+        var remoteInputLabel: String? = null
+
         notification.actions?.forEach { action ->
-            if (!action.remoteInputs.isNullOrEmpty()) {
+            val remoteInputs = action.remoteInputs
+            if (!remoteInputs.isNullOrEmpty()) {
                 hasRemoteInput = true
+                val firstInput = remoteInputs[0]
+                replyPendingIntent = action.actionIntent
+                remoteInputResultKey = firstInput.resultKey
+                remoteInputLabel = firstInput.label?.toString()
             }
         }
+
+        val isRetraction = isRetractNotification(rawText)
 
         return ParsedChatInfo(
             accountId = accountId,
@@ -207,8 +218,24 @@ object NotificationParser {
             timestamp = sbn.postTime,
             contentIntent = notification.contentIntent,
             hasRemoteInput = hasRemoteInput,
+            replyPendingIntent = replyPendingIntent,
+            remoteInputResultKey = remoteInputResultKey,
+            remoteInputLabel = remoteInputLabel,
+            isRetraction = isRetraction,
             isGroupSummary = isGroupSummary(sbn)
         )
+    }
+
+    /**
+     * 判定是否為 LINE 收回訊息通知
+     */
+    fun isRetractNotification(text: String?): Boolean {
+        if (text.isNullOrBlank()) return false
+        return text.contains("收回了一則訊息") ||
+                text.contains("收回訊息") ||
+                text.contains("已收回訊息") ||
+                text.contains("unsent a message") ||
+                text.contains("unsent")
     }
 
     /**
@@ -260,5 +287,9 @@ data class ParsedChatInfo(
     val timestamp: Long,
     val contentIntent: PendingIntent?,
     val hasRemoteInput: Boolean,
+    val replyPendingIntent: PendingIntent? = null,
+    val remoteInputResultKey: String? = null,
+    val remoteInputLabel: String? = null,
+    val isRetraction: Boolean = false,
     val isGroupSummary: Boolean = false
 )

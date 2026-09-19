@@ -11,7 +11,9 @@ data class ChatConversation(
     val isStackEnabled: Boolean = true,
     val lastMessageTime: Long,
     val lastMessageContent: String,
-    val unreadCount: Int = 1
+    val unreadCount: Int = 1,
+    val customRingtoneUri: String? = null,
+    val isMuted: Boolean = false
 )
 
 /**

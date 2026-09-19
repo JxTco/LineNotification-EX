@@ -1,5 +1,6 @@
 package com.notistack.line.service
 
+import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
@@ -106,9 +107,9 @@ class LineNotificationListenerService : NotificationListenerService() {
         val isSummary = NotificationParser.isGroupSummary(sbn)
         if (isSummary) {
             Log.d(TAG, "Ignored LINE group summary notification: ${sbn.key}")
-            // 若處於模式 B，主動消除原生群組摘要通知，防止摘要殘留於通知列
+            // 若處於模式 B，消除原生群組摘要通知，防止摘要殘留於通知列
             if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
-                cancelNotification(sbn.key)
+                hideNativeNotification(sbn.key)
             }
             return
         }
@@ -117,14 +118,53 @@ class LineNotificationListenerService : NotificationListenerService() {
         if (chatInfo.content.isBlank()) return
 
         // 去重第 2 層：僅比對系統事件層級 (相同 sbn.key 與相同 postTime)
-        // 絕不比對文字內容，保證使用者連續發送相同文字時每一則都能被正常接收
         if (MessageDeduplicator.isDuplicateSystemEvent(sbn.key, sbn.postTime)) {
             Log.d(TAG, "Duplicate system callback event ignored: ${sbn.key}")
             return
         }
 
+        // 快取原生直接回覆 Action (若有的話)
+        if (chatInfo.hasRemoteInput && chatInfo.replyPendingIntent != null) {
+            dispatcher.cacheReplyAction(
+                chatKey = chatInfo.chatKey,
+                lineReplyPendingIntent = chatInfo.replyPendingIntent,
+                resultKey = chatInfo.remoteInputResultKey,
+                label = chatInfo.remoteInputLabel
+            )
+        }
+
         serviceScope.launch {
             try {
+                // 處理收回訊息事件
+                if (chatInfo.isRetraction) {
+                    val isKeep = settingsManager.isRetractKeepEnabled.value
+                    if (isKeep) {
+                        database.markLatestMessageRetracted(chatInfo.chatKey, chatInfo.senderName)
+                        Log.i(TAG, "Marked retracted message for chat: ${chatInfo.chatKey}")
+                    } else {
+                        database.deleteLatestMessage(chatInfo.chatKey, chatInfo.senderName)
+                        Log.i(TAG, "Deleted retracted message for chat: ${chatInfo.chatKey}")
+                    }
+
+                    // 重新刷新自訂堆疊通知卡片
+                    val currentChat = database.getChat(chatInfo.chatKey)
+                    if (currentChat != null && currentChat.isStackEnabled) {
+                        val messages = database.getRecentMessages(currentChat.chatKey, limit = 15)
+                        dispatcher.dispatchStackedNotification(
+                            chat = currentChat,
+                            messages = messages,
+                            contentIntent = chatInfo.contentIntent,
+                            isNewMessage = false
+                        )
+                    }
+
+                    // 模式 B：隱藏原生收回訊息通知
+                    if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
+                        hideNativeNotification(sbn.key)
+                    }
+                    return@launch
+                }
+
                 // 去重第 3 層：本地資料庫比對去重，若為既有訊息則 isNewMessage 為 false 且不增未讀數
                 val saveResult = database.saveIncomingMessage(
                     chatKey = chatInfo.chatKey,
@@ -153,15 +193,34 @@ class LineNotificationListenerService : NotificationListenerService() {
                         isNewMessage = isNewMessage
                     )
 
-                    // 模式 B (隱藏 LINE 原生通知)：消除該則 LINE 原生通知 (僅消除 LINE 原生 key)
+                    // 模式 B (隱藏 LINE 原生通知)：透過 Snooze 隱身技術隱藏原生通知
+                    // 保留於系統底層 Snooze 隊列中，確保 LINE 內已讀時系統仍能派發 REASON_APP_CANCEL
                     if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
-                        cancelNotification(sbn.key)
-                        Log.d(TAG, "Mode B active: Cancelled LINE native notification for ${sbn.key}")
+                        hideNativeNotification(sbn.key)
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error handling incoming LINE notification", e)
             }
+        }
+    }
+
+    /**
+     * 模式 B 隱藏原生通知策略：優先採用 snoozeNotification 隱身延遲技術
+     * 既能讓原生通知從通知列消失，又能保留 NMS 監聽鏈，實現已讀同步
+     */
+    private fun hideNativeNotification(key: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                // 延遲 24 小時：通知從通知列隱藏，但 NMS 隊列保留
+                snoozeNotification(key, 24 * 60 * 60 * 1000L)
+                Log.d(TAG, "Mode B: Snoozed native notification for key $key")
+            } catch (e: Exception) {
+                Log.w(TAG, "snoozeNotification failed, fallback to cancelNotification", e)
+                cancelNotification(key)
+            }
+        } else {
+            cancelNotification(key)
         }
     }
 

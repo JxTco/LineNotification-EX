@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlin.math.abs
 
 data class SaveMessageResult(
     val chat: ChatConversation,
@@ -36,7 +35,7 @@ class NotiStackDatabase private constructor(context: Context) :
 
     companion object {
         private const val DB_NAME = "notistack.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
 
         private const val TABLE_CHATS = "chats"
         private const val TABLE_MESSAGES = "messages"
@@ -62,7 +61,9 @@ class NotiStackDatabase private constructor(context: Context) :
                 is_stack_enabled INTEGER NOT NULL DEFAULT 1,
                 last_message_time INTEGER NOT NULL,
                 last_message_content TEXT NOT NULL,
-                unread_count INTEGER NOT NULL DEFAULT 1
+                unread_count INTEGER NOT NULL DEFAULT 1,
+                custom_ringtone_uri TEXT,
+                is_muted INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -87,13 +88,18 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_MESSAGES")
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_CHATS")
-        onCreate(db)
+        if (oldVersion < 2) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN custom_ringtone_uri TEXT")
+                db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN is_muted INTEGER NOT NULL DEFAULT 0")
+            } catch (e: Exception) {
+                // Ignore if already added
+            }
+        }
     }
 
     /**
-     * 儲存收到的訊息並更新聊天室狀態 (內建資料庫層級去重機制)
+     * 儲存收到的訊息並更新聊天室狀態 (系統事件層級防重，文字相同不誤殺)
      */
     suspend fun saveIncomingMessage(
         chatKey: String,
@@ -108,7 +114,6 @@ class NotiStackDatabase private constructor(context: Context) :
         val db = writableDatabase
 
         // 1. 去重檢查：僅針對完全相同的系統通知事件 (相同的 rawKey 與相同的 timestamp)
-        // 絕不比對文字內容，避免使用者連續發送相同訊息 (例如「吃飯了嗎？」) 時發生誤殺
         var isDuplicate = false
         if (!rawKey.isNullOrBlank()) {
             val dedupQuery = "SELECT id FROM $TABLE_MESSAGES WHERE raw_key = ? AND timestamp = ? LIMIT 1"
@@ -122,15 +127,22 @@ class NotiStackDatabase private constructor(context: Context) :
         // 2. 查詢現有聊天室狀態
         var isStackEnabled = true
         var currentUnread = 0
-        db.rawQuery("SELECT is_stack_enabled, unread_count FROM $TABLE_CHATS WHERE chat_key = ?", arrayOf(chatKey)).use { cursor ->
+        var customRingtoneUri: String? = null
+        var isMuted = false
+
+        db.rawQuery(
+            "SELECT is_stack_enabled, unread_count, custom_ringtone_uri, is_muted FROM $TABLE_CHATS WHERE chat_key = ?",
+            arrayOf(chatKey)
+        ).use { cursor ->
             if (cursor.moveToFirst()) {
                 isStackEnabled = cursor.getInt(0) == 1
                 currentUnread = cursor.getInt(1)
+                customRingtoneUri = if (cursor.isNull(2)) null else cursor.getString(2)
+                isMuted = cursor.getInt(3) == 1
             }
         }
 
         if (isDuplicate) {
-            // 重複事件：不插入新訊息，不累計未讀數，直接回傳當前狀態
             val existingChat = ChatConversation(
                 chatKey = chatKey,
                 accountId = accountId,
@@ -139,7 +151,9 @@ class NotiStackDatabase private constructor(context: Context) :
                 isStackEnabled = isStackEnabled,
                 lastMessageTime = timestamp,
                 lastMessageContent = content,
-                unreadCount = currentUnread
+                unreadCount = currentUnread,
+                customRingtoneUri = customRingtoneUri,
+                isMuted = isMuted
             )
             return@withLock SaveMessageResult(existingChat, isNewMessage = false)
         }
@@ -166,6 +180,8 @@ class NotiStackDatabase private constructor(context: Context) :
             put("last_message_time", timestamp)
             put("last_message_content", content)
             put("unread_count", newUnread)
+            put("custom_ringtone_uri", customRingtoneUri)
+            put("is_muted", if (isMuted) 1 else 0)
         }
         db.insertWithOnConflict(TABLE_CHATS, null, chatValues, SQLiteDatabase.CONFLICT_REPLACE)
 
@@ -179,7 +195,9 @@ class NotiStackDatabase private constructor(context: Context) :
             isStackEnabled = isStackEnabled,
             lastMessageTime = timestamp,
             lastMessageContent = content,
-            unreadCount = newUnread
+            unreadCount = newUnread,
+            customRingtoneUri = customRingtoneUri,
+            isMuted = isMuted
         )
         SaveMessageResult(updatedChat, isNewMessage = true)
     }
@@ -219,6 +237,63 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
+     * 標記該聊天室最近一筆訊息為已收回 (若保留開關開啟)
+     */
+    suspend fun markLatestMessageRetracted(chatKey: String, senderName: String): Boolean = mutex.withLock {
+        val db = writableDatabase
+        // 尋找該發言人在該聊天室最近一筆尚未標記收回的訊息 ID
+        val findQuery = """
+            SELECT id FROM $TABLE_MESSAGES 
+            WHERE chat_key = ? AND (sender_name = ? OR ? = '') AND is_retracted = 0
+            ORDER BY timestamp DESC LIMIT 1
+        """.trimIndent()
+
+        var targetId: Long? = null
+        db.rawQuery(findQuery, arrayOf(chatKey, senderName, senderName)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                targetId = cursor.getLong(0)
+            }
+        }
+
+        if (targetId != null) {
+            val values = ContentValues().apply {
+                put("is_retracted", 1)
+                put("retracted_timestamp", System.currentTimeMillis())
+            }
+            db.update(TABLE_MESSAGES, values, "id = ?", arrayOf(targetId.toString()))
+            refreshChatsInternal(db)
+            return@withLock true
+        }
+        return@withLock false
+    }
+
+    /**
+     * 刪除該聊天室最近一筆訊息 (若保留開關關閉，比照官方移除訊息)
+     */
+    suspend fun deleteLatestMessage(chatKey: String, senderName: String): Boolean = mutex.withLock {
+        val db = writableDatabase
+        val findQuery = """
+            SELECT id FROM $TABLE_MESSAGES 
+            WHERE chat_key = ? AND (sender_name = ? OR ? = '')
+            ORDER BY timestamp DESC LIMIT 1
+        """.trimIndent()
+
+        var targetId: Long? = null
+        db.rawQuery(findQuery, arrayOf(chatKey, senderName, senderName)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                targetId = cursor.getLong(0)
+            }
+        }
+
+        if (targetId != null) {
+            db.delete(TABLE_MESSAGES, "id = ?", arrayOf(targetId.toString()))
+            refreshChatsInternal(db)
+            return@withLock true
+        }
+        return@withLock false
+    }
+
+    /**
      * 清除特定聊天室未讀與訊息 (已讀或手動清除時調用)
      */
     suspend fun clearChatMessages(chatKey: String) = mutex.withLock {
@@ -244,17 +319,56 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
-     * 檢查特定聊天室是否啟用自訂堆疊
+     * 設定特定聊天室之自訂鈴聲 URI
      */
-    suspend fun isChatStackEnabled(chatKey: String): Boolean = mutex.withLock {
+    suspend fun setChatRingtone(chatKey: String, ringtoneUri: String?) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("custom_ringtone_uri", ringtoneUri)
+        }
+        db.update(TABLE_CHATS, values, "chat_key = ?", arrayOf(chatKey))
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 設定特定聊天室靜音狀態
+     */
+    suspend fun setChatMuted(chatKey: String, isMuted: Boolean) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("is_muted", if (isMuted) 1 else 0)
+        }
+        db.update(TABLE_CHATS, values, "chat_key = ?", arrayOf(chatKey))
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 查詢指定聊天室
+     */
+    suspend fun getChat(chatKey: String): ChatConversation? = mutex.withLock {
         val db = readableDatabase
-        db.rawQuery("SELECT is_stack_enabled FROM $TABLE_CHATS WHERE chat_key = ?", arrayOf(chatKey)).use { cursor ->
+        val query = """
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted 
+            FROM $TABLE_CHATS WHERE chat_key = ?
+        """.trimIndent()
+
+        db.rawQuery(query, arrayOf(chatKey)).use { cursor ->
             if (cursor.moveToFirst()) {
-                cursor.getInt(0) == 1
-            } else {
-                true
+                return@withLock ChatConversation(
+                    chatKey = cursor.getString(0),
+                    accountId = cursor.getString(1),
+                    title = cursor.getString(2),
+                    isGroup = cursor.getInt(3) == 1,
+                    isStackEnabled = cursor.getInt(4) == 1,
+                    lastMessageTime = cursor.getLong(5),
+                    lastMessageContent = cursor.getString(6),
+                    unreadCount = cursor.getInt(7),
+                    customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
+                    isMuted = cursor.getInt(9) == 1
+                )
             }
         }
+        return@withLock null
     }
 
     private fun refreshChats() {
@@ -267,7 +381,11 @@ class NotiStackDatabase private constructor(context: Context) :
 
     private fun refreshChatsInternal(db: SQLiteDatabase) {
         val list = mutableListOf<ChatConversation>()
-        val query = "SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count FROM $TABLE_CHATS ORDER BY last_message_time DESC"
+        val query = """
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted 
+            FROM $TABLE_CHATS ORDER BY last_message_time DESC
+        """.trimIndent()
+
         db.rawQuery(query, null).use { cursor ->
             while (cursor.moveToNext()) {
                 list.add(
@@ -279,7 +397,9 @@ class NotiStackDatabase private constructor(context: Context) :
                         isStackEnabled = cursor.getInt(4) == 1,
                         lastMessageTime = cursor.getLong(5),
                         lastMessageContent = cursor.getString(6),
-                        unreadCount = cursor.getInt(7)
+                        unreadCount = cursor.getInt(7),
+                        customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
+                        isMuted = cursor.getInt(9) == 1
                     )
                 )
             }

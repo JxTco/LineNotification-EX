@@ -1,12 +1,15 @@
 package com.notistack.line.ui
 
 import android.Manifest
+import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -39,6 +42,7 @@ import androidx.core.content.ContextCompat
 import com.notistack.line.core.model.CapturedNotification
 import com.notistack.line.core.model.ChatConversation
 import com.notistack.line.core.model.EventType
+import com.notistack.line.core.model.LineAccount
 import com.notistack.line.data.local.NotiStackDatabase
 import com.notistack.line.data.preferences.NotificationMode
 import com.notistack.line.data.preferences.SettingsManager
@@ -101,8 +105,48 @@ fun MainScreen() {
 
     val currentMode by settingsManager.notificationMode.collectAsState()
     val isGlobalStackEnabled by settingsManager.isGlobalStackEnabled.collectAsState()
+    val isRetractKeepEnabled by settingsManager.isRetractKeepEnabled.collectAsState()
 
     var selectedTabIndex by remember { mutableIntStateOf(0) }
+    var activePickerTarget by remember { mutableStateOf<String?>(null) }
+
+    val ringtonePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val uri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                result.data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                result.data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            }
+            val uriStr = uri?.toString()
+            val target = activePickerTarget
+            if (target != null) {
+                if (target.startsWith("acc_")) {
+                    val accId = target.removePrefix("acc_")
+                    settingsManager.setAccountRingtoneUri(accId, uriStr)
+                } else if (target.startsWith("chat_")) {
+                    val chatKey = target.removePrefix("chat_")
+                    scope.launch { database.setChatRingtone(chatKey, uriStr) }
+                }
+            }
+        }
+    }
+
+    val onLaunchPicker: (String?, String) -> Unit = { existingUriStr, targetKey ->
+        activePickerTarget = targetKey
+        val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "選擇通知鈴聲")
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
+            if (!existingUriStr.isNullOrBlank()) {
+                putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(existingUriStr))
+            }
+        }
+        ringtonePickerLauncher.launch(intent)
+    }
 
     var isListenerPermissionGranted by remember {
         mutableStateOf(isNotificationListenerEnabled(context))
@@ -155,7 +199,6 @@ fun MainScreen() {
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // 頂部常駐權限狀態警示
             StatusBanner(
                 isListenerPermissionGranted = isListenerPermissionGranted,
                 isServiceConnected = isServiceConnected,
@@ -171,12 +214,11 @@ fun MainScreen() {
                 }
             )
 
-            // 分頁 Tab 列
             TabRow(selectedTabIndex = selectedTabIndex) {
                 Tab(
                     selected = selectedTabIndex == 0,
                     onClick = { selectedTabIndex = 0 },
-                    text = { Text("通知模式與聊天室 (${chats.size})") },
+                    text = { Text("通知設定與聊天室 (${chats.size})") },
                     icon = { Icon(Icons.Default.Forum, contentDescription = null) }
                 )
                 Tab(
@@ -188,16 +230,27 @@ fun MainScreen() {
             }
 
             if (selectedTabIndex == 0) {
-                // Tab 0: 模式設定與個別聊天室管理
                 SettingsAndChatsView(
                     currentMode = currentMode,
                     isGlobalStackEnabled = isGlobalStackEnabled,
+                    isRetractKeepEnabled = isRetractKeepEnabled,
                     chats = chats,
                     detectedAccounts = detectedAccounts.values.toList(),
                     onModeChange = { settingsManager.setNotificationMode(it) },
                     onGlobalStackToggle = { settingsManager.setGlobalStackEnabled(it) },
+                    onRetractKeepToggle = { settingsManager.setRetractKeepEnabled(it) },
                     onChatStackToggle = { chat, enabled ->
                         scope.launch { database.setChatStackEnabled(chat.chatKey, enabled) }
+                    },
+                    onToggleChatMute = { chat ->
+                        scope.launch { database.setChatMuted(chat.chatKey, !chat.isMuted) }
+                    },
+                    onPickChatRingtone = { chat ->
+                        onLaunchPicker(chat.customRingtoneUri, "chat_${chat.chatKey}")
+                    },
+                    onPickAccountRingtone = { account ->
+                        val currentUri = settingsManager.getAccountRingtoneUri("user_${account.userId}")
+                        onLaunchPicker(currentUri, "acc_user_${account.userId}")
                     },
                     onClearChat = { chat ->
                         scope.launch {
@@ -207,7 +260,6 @@ fun MainScreen() {
                     }
                 )
             } else {
-                // Tab 1: 即時事件日誌與測試模擬
                 LogsView(
                     logs = logs,
                     onSendTest = { sendTestNotification(context) },
@@ -272,11 +324,16 @@ fun StatusBanner(
 fun SettingsAndChatsView(
     currentMode: NotificationMode,
     isGlobalStackEnabled: Boolean,
+    isRetractKeepEnabled: Boolean,
     chats: List<ChatConversation>,
-    detectedAccounts: List<com.notistack.line.core.model.LineAccount>,
+    detectedAccounts: List<LineAccount>,
     onModeChange: (NotificationMode) -> Unit,
     onGlobalStackToggle: (Boolean) -> Unit,
+    onRetractKeepToggle: (Boolean) -> Unit,
     onChatStackToggle: (ChatConversation, Boolean) -> Unit,
+    onToggleChatMute: (ChatConversation) -> Unit,
+    onPickChatRingtone: (ChatConversation) -> Unit,
+    onPickAccountRingtone: (LineAccount) -> Unit,
     onClearChat: (ChatConversation) -> Unit
 ) {
     LazyColumn(
@@ -285,16 +342,16 @@ fun SettingsAndChatsView(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 全域通知模式卡片 (模式 A vs 模式 B)
+        // 全域通知設定卡片 (模式 A/B 與收回保留開關)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
             ) {
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("LINE 通知呈現模式", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("通知呈現模式與進階設定", fontWeight = FontWeight.Bold, fontSize = 15.sp)
 
-                    // 模式 A 選項
+                    // 模式 A
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -316,7 +373,7 @@ fun SettingsAndChatsView(
                         }
                     }
 
-                    // 模式 B 選項
+                    // 模式 B
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -334,7 +391,7 @@ fun SettingsAndChatsView(
                         Spacer(Modifier.width(8.dp))
                         Column {
                             Text("模式 B：隱藏 LINE 原生通知，純自訂堆疊 (推薦)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
-                            Text("自動清除 LINE 原生通知，通知列乾淨不重複", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
+                            Text("隱藏原生通知且支援 LINE 內已讀自動消除", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
                         }
                     }
 
@@ -354,25 +411,56 @@ fun SettingsAndChatsView(
                             onCheckedChange = onGlobalStackToggle
                         )
                     }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                    // 收回訊息保留開關
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text("保留已收回訊息", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                            Text("開啟時對方收回仍保留文字並加刪除線；關閉時比照官方同步移除", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
+                        }
+                        Switch(
+                            checked = isRetractKeepEnabled,
+                            onCheckedChange = onRetractKeepToggle
+                        )
+                    }
                 }
             }
         }
 
-        // 雙開帳號識別資訊 (若有)
+        // 雙開帳號識別與獨立鈴聲卡片
         if (detectedAccounts.isNotEmpty()) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                 ) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("已識別的 LINE 執行個體", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("LINE 帳號獨立通知設定 (${detectedAccounts.size})", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         detectedAccounts.forEach { acc ->
-                            Text(
-                                "• ${acc.displayName} (User ID: ${acc.userId})",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.primary
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(acc.displayName, fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                                    Text("User ID: ${acc.userId} | UID: ${acc.uid}", fontSize = 10.sp, color = MaterialTheme.colorScheme.outline)
+                                }
+                                OutlinedButton(
+                                    onClick = { onPickAccountRingtone(acc) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("帳號預設鈴聲", fontSize = 11.sp)
+                                }
+                            }
                         }
                     }
                 }
@@ -387,7 +475,7 @@ fun SettingsAndChatsView(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "個別聊天室堆疊設定 (${chats.size})",
+                    "個別聊天室管理與鈴聲覆寫 (${chats.size})",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
@@ -409,7 +497,7 @@ fun SettingsAndChatsView(
                     ) {
                         Icon(Icons.Default.ChatBubbleOutline, contentDescription = null, tint = MaterialTheme.colorScheme.outline)
                         Text("尚未捕捉到任何聊天室", fontWeight = FontWeight.Medium, fontSize = 13.sp)
-                        Text("當 LINE 收到新訊息時，會自動建立聊天室並加入此處進行個別設定。", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
+                        Text("當收到 LINE 訊息時，會自動建立聊天室並加入此處進行個別設定。", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
                     }
                 }
             }
@@ -418,6 +506,8 @@ fun SettingsAndChatsView(
                 ChatCard(
                     chat = chat,
                     onToggleStack = { enabled -> onChatStackToggle(chat, enabled) },
+                    onToggleMute = { onToggleChatMute(chat) },
+                    onPickRingtone = { onPickChatRingtone(chat) },
                     onClear = { onClearChat(chat) }
                 )
             }
@@ -429,6 +519,8 @@ fun SettingsAndChatsView(
 fun ChatCard(
     chat: ChatConversation,
     onToggleStack: (Boolean) -> Unit,
+    onToggleMute: () -> Unit,
+    onPickRingtone: () -> Unit,
     onClear: () -> Unit
 ) {
     val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -456,11 +548,15 @@ fun ChatCard(
                             color = MaterialTheme.colorScheme.secondaryContainer,
                             shape = RoundedCornerShape(4.dp)
                         ) {
-                            Text(
-                                "群組",
-                                fontSize = 10.sp,
-                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                            )
+                            Text("群組", fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                        }
+                    }
+                    if (chat.isMuted) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text("靜音", fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
                         }
                     }
                     if (chat.unreadCount > 0) {
@@ -490,34 +586,62 @@ fun ChatCard(
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
 
+            // 第一行控制項：啟用堆疊 + 靜音開關
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("啟用堆疊通知", fontSize = 12.sp)
-                    Spacer(Modifier.width(8.dp))
+                    Text("啟用堆疊", fontSize = 12.sp)
+                    Spacer(Modifier.width(6.dp))
                     Switch(
                         checked = chat.isStackEnabled,
-                        onCheckedChange = onToggleStack,
-                        modifier = Modifier.scale(0.8f)
+                        onCheckedChange = onToggleStack
                     )
                 }
 
-                TextButton(onClick = onClear) {
-                    Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onToggleMute) {
+                        Icon(
+                            imageVector = if (chat.isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                            contentDescription = "靜音切換",
+                            tint = if (chat.isMuted) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline
+                        )
+                    }
+
+                    TextButton(onClick = onClear) {
+                        Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("清除未讀", fontSize = 11.sp)
+                    }
+                }
+            }
+
+            // 第二行控制項：自訂鈴聲選擇
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (chat.customRingtoneUri != null) "已設定個別鈴聲" else "鈴聲：依帳號預設",
+                    fontSize = 11.sp,
+                    color = if (chat.customRingtoneUri != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                )
+
+                OutlinedButton(
+                    onClick = onPickRingtone,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("清除未讀", fontSize = 11.sp)
+                    Text(if (chat.customRingtoneUri != null) "變更鈴聲" else "設定鈴聲", fontSize = 11.sp)
                 }
             }
         }
     }
 }
-
-private fun Modifier.scale(scale: Float): Modifier = this.then(
-    Modifier.padding(0.dp) // placeholder for scale
-)
 
 @Composable
 fun LogsView(
