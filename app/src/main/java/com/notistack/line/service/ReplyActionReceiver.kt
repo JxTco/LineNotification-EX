@@ -51,6 +51,9 @@ class ReplyActionReceiver : BroadcastReceiver() {
 
         Log.d(TAG, "Received direct reply: '$replyText' for chat: $chatTitle")
 
+        // 標記該聊天室剛剛完成通知列回覆，防止 LINE 隨後觸發的 cancel 回呼將本卡片誤刪
+        ReplyStateTracker.markJustReplied(chatKey)
+
         // 1. 轉發回覆文字給 LINE 原生 PendingIntent
         if (lineReplyPendingIntent != null) {
             val forwardIntent = Intent()
