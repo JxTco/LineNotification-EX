@@ -42,6 +42,24 @@
             </intent-filter>
         </receiver>
 
+        <!-- 手動劃除通知廣播接收器 -->
+        <receiver
+            android:name=".service.NotificationDismissedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.notistack.line.ACTION_STACK_DISMISSED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 點擊通知卡片廣播接收器 -->
+        <receiver
+            android:name=".service.NotificationClickReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.notistack.line.ACTION_STACK_CLICKED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

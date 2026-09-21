@@ -35,7 +35,7 @@ class NotiStackDatabase private constructor(context: Context) :
 
     companion object {
         private const val DB_NAME = "notistack.db"
-        private const val DB_VERSION = 2
+        private const val DB_VERSION = 3
 
         private const val TABLE_CHATS = "chats"
         private const val TABLE_MESSAGES = "messages"
@@ -63,7 +63,8 @@ class NotiStackDatabase private constructor(context: Context) :
                 last_message_content TEXT NOT NULL,
                 unread_count INTEGER NOT NULL DEFAULT 1,
                 custom_ringtone_uri TEXT,
-                is_muted INTEGER NOT NULL DEFAULT 0
+                is_muted INTEGER NOT NULL DEFAULT 0,
+                keep_native_when_disabled INTEGER NOT NULL DEFAULT 1
             )
             """.trimIndent()
         )
@@ -92,6 +93,13 @@ class NotiStackDatabase private constructor(context: Context) :
             try {
                 db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN custom_ringtone_uri TEXT")
                 db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN is_muted INTEGER NOT NULL DEFAULT 0")
+            } catch (e: Exception) {
+                // Ignore if already added
+            }
+        }
+        if (oldVersion < 3) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN keep_native_when_disabled INTEGER NOT NULL DEFAULT 1")
             } catch (e: Exception) {
                 // Ignore if already added
             }
@@ -129,9 +137,10 @@ class NotiStackDatabase private constructor(context: Context) :
         var currentUnread = 0
         var customRingtoneUri: String? = null
         var isMuted = false
+        var keepNativeWhenDisabled = true
 
         db.rawQuery(
-            "SELECT is_stack_enabled, unread_count, custom_ringtone_uri, is_muted FROM $TABLE_CHATS WHERE chat_key = ?",
+            "SELECT is_stack_enabled, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled FROM $TABLE_CHATS WHERE chat_key = ?",
             arrayOf(chatKey)
         ).use { cursor ->
             if (cursor.moveToFirst()) {
@@ -139,6 +148,7 @@ class NotiStackDatabase private constructor(context: Context) :
                 currentUnread = cursor.getInt(1)
                 customRingtoneUri = if (cursor.isNull(2)) null else cursor.getString(2)
                 isMuted = cursor.getInt(3) == 1
+                keepNativeWhenDisabled = cursor.getInt(4) == 1
             }
         }
 
@@ -153,7 +163,8 @@ class NotiStackDatabase private constructor(context: Context) :
                 lastMessageContent = content,
                 unreadCount = currentUnread,
                 customRingtoneUri = customRingtoneUri,
-                isMuted = isMuted
+                isMuted = isMuted,
+                keepNativeWhenDisabled = keepNativeWhenDisabled
             )
             return@withLock SaveMessageResult(existingChat, isNewMessage = false)
         }
@@ -182,6 +193,7 @@ class NotiStackDatabase private constructor(context: Context) :
             put("unread_count", newUnread)
             put("custom_ringtone_uri", customRingtoneUri)
             put("is_muted", if (isMuted) 1 else 0)
+            put("keep_native_when_disabled", if (keepNativeWhenDisabled) 1 else 0)
         }
         db.insertWithOnConflict(TABLE_CHATS, null, chatValues, SQLiteDatabase.CONFLICT_REPLACE)
 
@@ -197,7 +209,8 @@ class NotiStackDatabase private constructor(context: Context) :
             lastMessageContent = content,
             unreadCount = newUnread,
             customRingtoneUri = customRingtoneUri,
-            isMuted = isMuted
+            isMuted = isMuted,
+            keepNativeWhenDisabled = keepNativeWhenDisabled
         )
         SaveMessageResult(updatedChat, isNewMessage = true)
     }
@@ -238,20 +251,37 @@ class NotiStackDatabase private constructor(context: Context) :
 
     /**
      * 標記該聊天室最近一筆訊息為已收回 (若保留開關開啟)
+     * 採用兩階段智能匹配：先比對發言人，若未命中 (例如群組名稱覆蓋或字串格式差異) 則備援回退匹配該聊天室最近一筆尚未收回之訊息
      */
     suspend fun markLatestMessageRetracted(chatKey: String, senderName: String): Boolean = mutex.withLock {
         val db = writableDatabase
-        // 尋找該發言人在該聊天室最近一筆尚未標記收回的訊息 ID
-        val findQuery = """
-            SELECT id FROM $TABLE_MESSAGES 
-            WHERE chat_key = ? AND (sender_name = ? OR ? = '') AND is_retracted = 0
-            ORDER BY timestamp DESC LIMIT 1
-        """.trimIndent()
-
         var targetId: Long? = null
-        db.rawQuery(findQuery, arrayOf(chatKey, senderName, senderName)).use { cursor ->
-            if (cursor.moveToFirst()) {
-                targetId = cursor.getLong(0)
+
+        // 階段 1: 優先尋找該發言人在該聊天室最近一筆尚未標記收回的訊息
+        if (senderName.isNotBlank()) {
+            val findQuery = """
+                SELECT id FROM $TABLE_MESSAGES 
+                WHERE chat_key = ? AND sender_name = ? AND is_retracted = 0
+                ORDER BY timestamp DESC LIMIT 1
+            """.trimIndent()
+            db.rawQuery(findQuery, arrayOf(chatKey, senderName)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    targetId = cursor.getLong(0)
+                }
+            }
+        }
+
+        // 階段 2 (防禦備援): 若階段 1 未能命中，回退匹配該聊天室最近一筆尚未收回之訊息
+        if (targetId == null) {
+            val fallbackQuery = """
+                SELECT id FROM $TABLE_MESSAGES 
+                WHERE chat_key = ? AND is_retracted = 0
+                ORDER BY timestamp DESC LIMIT 1
+            """.trimIndent()
+            db.rawQuery(fallbackQuery, arrayOf(chatKey)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    targetId = cursor.getLong(0)
+                }
             }
         }
 
@@ -269,19 +299,37 @@ class NotiStackDatabase private constructor(context: Context) :
 
     /**
      * 刪除該聊天室最近一筆訊息 (若保留開關關閉，比照官方移除訊息)
+     * 同樣採用兩階段智能匹配
      */
     suspend fun deleteLatestMessage(chatKey: String, senderName: String): Boolean = mutex.withLock {
         val db = writableDatabase
-        val findQuery = """
-            SELECT id FROM $TABLE_MESSAGES 
-            WHERE chat_key = ? AND (sender_name = ? OR ? = '')
-            ORDER BY timestamp DESC LIMIT 1
-        """.trimIndent()
-
         var targetId: Long? = null
-        db.rawQuery(findQuery, arrayOf(chatKey, senderName, senderName)).use { cursor ->
-            if (cursor.moveToFirst()) {
-                targetId = cursor.getLong(0)
+
+        // 階段 1: 優先尋找該發言人在該聊天室最近一筆訊息
+        if (senderName.isNotBlank()) {
+            val findQuery = """
+                SELECT id FROM $TABLE_MESSAGES 
+                WHERE chat_key = ? AND sender_name = ?
+                ORDER BY timestamp DESC LIMIT 1
+            """.trimIndent()
+            db.rawQuery(findQuery, arrayOf(chatKey, senderName)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    targetId = cursor.getLong(0)
+                }
+            }
+        }
+
+        // 階段 2: 備援回退匹配該聊天室最近一筆訊息
+        if (targetId == null) {
+            val fallbackQuery = """
+                SELECT id FROM $TABLE_MESSAGES 
+                WHERE chat_key = ?
+                ORDER BY timestamp DESC LIMIT 1
+            """.trimIndent()
+            db.rawQuery(fallbackQuery, arrayOf(chatKey)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    targetId = cursor.getLong(0)
+                }
             }
         }
 
@@ -319,6 +367,18 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
+     * 設定特定聊天室關閉堆疊時，是否保留 LINE 原生通知
+     */
+    suspend fun setChatKeepNativeWhenDisabled(chatKey: String, keep: Boolean) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("keep_native_when_disabled", if (keep) 1 else 0)
+        }
+        db.update(TABLE_CHATS, values, "chat_key = ?", arrayOf(chatKey))
+        refreshChatsInternal(db)
+    }
+
+    /**
      * 設定特定聊天室之自訂鈴聲 URI
      */
     suspend fun setChatRingtone(chatKey: String, ringtoneUri: String?) = mutex.withLock {
@@ -348,7 +408,7 @@ class NotiStackDatabase private constructor(context: Context) :
     suspend fun getChat(chatKey: String): ChatConversation? = mutex.withLock {
         val db = readableDatabase
         val query = """
-            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted 
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled 
             FROM $TABLE_CHATS WHERE chat_key = ?
         """.trimIndent()
 
@@ -364,7 +424,8 @@ class NotiStackDatabase private constructor(context: Context) :
                     lastMessageContent = cursor.getString(6),
                     unreadCount = cursor.getInt(7),
                     customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
-                    isMuted = cursor.getInt(9) == 1
+                    isMuted = cursor.getInt(9) == 1,
+                    keepNativeWhenDisabled = cursor.getInt(10) == 1
                 )
             }
         }
@@ -382,7 +443,7 @@ class NotiStackDatabase private constructor(context: Context) :
     private fun refreshChatsInternal(db: SQLiteDatabase) {
         val list = mutableListOf<ChatConversation>()
         val query = """
-            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted 
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled 
             FROM $TABLE_CHATS ORDER BY last_message_time DESC
         """.trimIndent()
 
@@ -399,7 +460,8 @@ class NotiStackDatabase private constructor(context: Context) :
                         lastMessageContent = cursor.getString(6),
                         unreadCount = cursor.getInt(7),
                         customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
-                        isMuted = cursor.getInt(9) == 1
+                        isMuted = cursor.getInt(9) == 1,
+                        keepNativeWhenDisabled = cursor.getInt(10) == 1
                     )
                 )
             }

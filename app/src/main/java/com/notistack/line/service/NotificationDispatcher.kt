@@ -156,9 +156,35 @@ class NotificationDispatcher(private val context: Context) {
             chatContentIntents[chat.chatKey] = contentIntent
         }
         val intentToUse = contentIntent ?: chatContentIntents[chat.chatKey]
-        if (intentToUse != null) {
-            builder.setContentIntent(intentToUse)
+
+        // 綁定點擊 Intent：透過 NotificationClickReceiver 轉發至 LINE 並同步清空快取與消除卡片
+        val clickIntent = Intent(context, NotificationClickReceiver::class.java).apply {
+            action = NotificationClickReceiver.ACTION_STACK_CLICKED
+            putExtra(NotificationClickReceiver.EXTRA_CHAT_KEY, chat.chatKey)
+            if (intentToUse != null) {
+                putExtra(NotificationClickReceiver.EXTRA_CONTENT_INTENT, intentToUse)
+            }
         }
+        val clickPendingIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + 30000,
+            clickIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        builder.setContentIntent(clickPendingIntent)
+
+        // 綁定手動劃除 (Swipe-to-Dismiss) Intent：使用者手動滑除卡片時清空該聊天室訊息快取
+        val deleteIntent = Intent(context, NotificationDismissedReceiver::class.java).apply {
+            action = NotificationDismissedReceiver.ACTION_STACK_DISMISSED
+            putExtra(NotificationDismissedReceiver.EXTRA_CHAT_KEY, chat.chatKey)
+        }
+        val deletePendingIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + 20000,
+            deleteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        builder.setDeleteIntent(deletePendingIntent)
 
         // 綁定直接回覆 (Direct Reply) Action
         val replyInfo = chatReplyActions[chat.chatKey]

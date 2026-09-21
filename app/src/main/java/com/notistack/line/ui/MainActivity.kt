@@ -242,6 +242,9 @@ fun MainScreen() {
                     onChatStackToggle = { chat, enabled ->
                         scope.launch { database.setChatStackEnabled(chat.chatKey, enabled) }
                     },
+                    onToggleKeepNative = { chat, keep ->
+                        scope.launch { database.setChatKeepNativeWhenDisabled(chat.chatKey, keep) }
+                    },
                     onToggleChatMute = { chat ->
                         scope.launch { database.setChatMuted(chat.chatKey, !chat.isMuted) }
                     },
@@ -331,6 +334,7 @@ fun SettingsAndChatsView(
     onGlobalStackToggle: (Boolean) -> Unit,
     onRetractKeepToggle: (Boolean) -> Unit,
     onChatStackToggle: (ChatConversation, Boolean) -> Unit,
+    onToggleKeepNative: (ChatConversation, Boolean) -> Unit,
     onToggleChatMute: (ChatConversation) -> Unit,
     onPickChatRingtone: (ChatConversation) -> Unit,
     onPickAccountRingtone: (LineAccount) -> Unit,
@@ -506,6 +510,7 @@ fun SettingsAndChatsView(
                 ChatCard(
                     chat = chat,
                     onToggleStack = { enabled -> onChatStackToggle(chat, enabled) },
+                    onToggleKeepNative = { keep -> onToggleKeepNative(chat, keep) },
                     onToggleMute = { onToggleChatMute(chat) },
                     onPickRingtone = { onPickChatRingtone(chat) },
                     onClear = { onClearChat(chat) }
@@ -519,6 +524,7 @@ fun SettingsAndChatsView(
 fun ChatCard(
     chat: ChatConversation,
     onToggleStack: (Boolean) -> Unit,
+    onToggleKeepNative: (Boolean) -> Unit,
     onToggleMute: () -> Unit,
     onPickRingtone: () -> Unit,
     onClear: () -> Unit
@@ -614,6 +620,35 @@ fun ChatCard(
                         Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
                         Text("清除未讀", fontSize = 11.sp)
+                    }
+                }
+            }
+
+            // 若關閉堆疊，顯示是否保留 LINE 原生通知之專屬切換開關 (項目 5 強化)
+            if (!chat.isStackEnabled) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("關閉堆疊時保留原生通知", fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                text = if (chat.keepNativeWhenDisabled) "此聊天室回歸顯示 LINE 原生通知" else "此聊天室完全靜音 (隱藏原生通知)",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        Switch(
+                            checked = chat.keepNativeWhenDisabled,
+                            onCheckedChange = onToggleKeepNative
+                        )
                     }
                 }
             }

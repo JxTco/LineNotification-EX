@@ -206,7 +206,20 @@ object NotificationParser {
             }
         }
 
-        val isRetraction = isRetractNotification(rawText)
+        val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
+        val tickerText = notification.tickerText?.toString()
+
+        val isRetraction = isRetractNotification(rawText, bigText, subText, tickerText)
+
+        // 若為收回事件，嘗試從內文萃取真正的收回發言人 (例如群組中「小明已收回訊息」)
+        if (isRetraction) {
+            val retractSender = extractRetractSender(rawText) 
+                ?: extractRetractSender(bigText) 
+                ?: extractRetractSender(tickerText)
+            if (!retractSender.isNullOrBlank()) {
+                senderName = retractSender
+            }
+        }
 
         return ParsedChatInfo(
             accountId = accountId,
@@ -227,15 +240,28 @@ object NotificationParser {
     }
 
     /**
-     * 判定是否為 LINE 收回訊息通知
+     * 判定是否為 LINE 收回訊息通知 (綜合比對多個欄位來源與不同版本之繁中/英文用詞)
      */
-    fun isRetractNotification(text: String?): Boolean {
-        if (text.isNullOrBlank()) return false
-        return text.contains("收回了一則訊息") ||
-                text.contains("收回訊息") ||
-                text.contains("已收回訊息") ||
-                text.contains("unsent a message") ||
-                text.contains("unsent")
+    fun isRetractNotification(vararg texts: CharSequence?): Boolean {
+        val combined = texts.filterNotNull().joinToString(" ")
+        if (combined.isBlank()) return false
+        return combined.contains("收回了一則訊息") ||
+                combined.contains("已收回了一則訊息") ||
+                combined.contains("收回訊息") ||
+                combined.contains("已收回訊息") ||
+                combined.contains("已收回") ||
+                combined.contains("unsent a message") ||
+                combined.contains("unsent")
+    }
+
+    /**
+     * 從收回文字中提取發言人名稱 (例如「小明已收回訊息」、「小明: 已收回訊息」或「小明收回了一則訊息」)
+     */
+    fun extractRetractSender(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        val match = Regex("""^([^:\n]{1,30})[:：]?\s*(?:已收回|收回了)""").find(text.trim())
+        val extracted = match?.groupValues?.getOrNull(1)?.trim()
+        return if (!extracted.isNullOrBlank() && extracted != text.trim()) extracted else null
     }
 
     /**

@@ -226,6 +226,18 @@ class LineNotificationListenerService : NotificationListenerService() {
                         cancelNotification(sbn.key)
                         Log.d(TAG, "Mode B active: Cancelled LINE native notification for ${sbn.key}")
                     }
+                } else {
+                    // 該聊天室已關閉自訂堆疊 (或全域關閉堆疊)
+                    if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
+                        if (!chat.keepNativeWhenDisabled) {
+                            // 使用者選擇在關閉堆疊時，連原生通知也一併消除 (徹底靜音封鎖)
+                            cancelNotification(sbn.key)
+                            Log.d(TAG, "Chat ${chat.title} stack disabled and keepNative is false: Cancelled LINE native notification.")
+                        } else {
+                            // 使用者選擇保留該聊天室之原生通知 (回歸 LINE 原生提醒)
+                            Log.d(TAG, "Chat ${chat.title} stack disabled: Preserved LINE native notification.")
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error handling incoming LINE notification", e)
