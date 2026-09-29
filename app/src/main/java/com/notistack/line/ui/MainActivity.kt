@@ -18,12 +18,14 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import com.notistack.line.core.model.ChatTagGroup
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -107,8 +109,12 @@ fun MainScreen() {
     val isGlobalStackEnabled by settingsManager.isGlobalStackEnabled.collectAsState()
     val isRetractKeepEnabled by settingsManager.isRetractKeepEnabled.collectAsState()
 
+    val tagGroups by database.tagGroupsFlow.collectAsState()
+
     var selectedTabIndex by remember { mutableIntStateOf(0) }
     var activePickerTarget by remember { mutableStateOf<String?>(null) }
+    var showTagGroupDialog by remember { mutableStateOf(false) }
+    var accountToReset by remember { mutableStateOf<LineAccount?>(null) }
 
     val ringtonePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -129,16 +135,21 @@ fun MainScreen() {
                 } else if (target.startsWith("chat_")) {
                     val chatKey = target.removePrefix("chat_")
                     scope.launch { database.setChatRingtone(chatKey, uriStr) }
+                } else if (target.startsWith("group_batch_")) {
+                    val groupId = target.removePrefix("group_batch_").toLongOrNull()
+                    if (groupId != null) {
+                        scope.launch { database.batchSetGroupRingtone(groupId, uriStr) }
+                    }
                 }
             }
         }
     }
 
-    val onLaunchPicker: (String?, String) -> Unit = { existingUriStr, targetKey ->
+    val onLaunchPicker: (String?, String, String) -> Unit = { existingUriStr, targetKey, pickerTitle ->
         activePickerTarget = targetKey
         val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
             putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
-            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "選擇通知鈴聲")
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, pickerTitle)
             putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
             putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
             if (!existingUriStr.isNullOrBlank()) {
@@ -236,9 +247,11 @@ fun MainScreen() {
                     isRetractKeepEnabled = isRetractKeepEnabled,
                     chats = chats,
                     detectedAccounts = detectedAccounts.values.toList(),
+                    tagGroups = tagGroups,
                     onModeChange = { settingsManager.setNotificationMode(it) },
                     onGlobalStackToggle = { settingsManager.setGlobalStackEnabled(it) },
                     onRetractKeepToggle = { settingsManager.setRetractKeepEnabled(it) },
+                    onOpenTagGroups = { showTagGroupDialog = true },
                     onChatStackToggle = { chat, enabled ->
                         scope.launch { database.setChatStackEnabled(chat.chatKey, enabled) }
                     },
@@ -249,11 +262,17 @@ fun MainScreen() {
                         scope.launch { database.setChatMuted(chat.chatKey, !chat.isMuted) }
                     },
                     onPickChatRingtone = { chat ->
-                        onLaunchPicker(chat.customRingtoneUri, "chat_${chat.chatKey}")
+                        onLaunchPicker(chat.customRingtoneUri, "chat_${chat.chatKey}", "選擇個別聊天室鈴聲")
+                    },
+                    onResetChatRingtone = { chat ->
+                        scope.launch { database.resetChatRingtone(chat.chatKey) }
                     },
                     onPickAccountRingtone = { account ->
                         val currentUri = settingsManager.getAccountRingtoneUri("user_${account.userId}")
-                        onLaunchPicker(currentUri, "acc_user_${account.userId}")
+                        onLaunchPicker(currentUri, "acc_user_${account.userId}", "選擇帳號預設通知鈴聲")
+                    },
+                    onResetAccountRingtones = { account ->
+                        accountToReset = account
                     },
                     onClearChat = { chat ->
                         scope.launch {
@@ -270,6 +289,69 @@ fun MainScreen() {
                 )
             }
         }
+    }
+
+    if (showTagGroupDialog) {
+        TagGroupManagementDialog(
+            tagGroups = tagGroups,
+            chats = chats,
+            onDismiss = { showTagGroupDialog = false },
+            onCreateGroup = { name ->
+                scope.launch { database.createTagGroup(name) }
+            },
+            onDeleteGroup = { groupId ->
+                scope.launch { database.deleteTagGroup(groupId) }
+            },
+            onBatchSetRingtone = { groupId ->
+                onLaunchPicker(null, "group_batch_$groupId", "選擇群組統一鈴聲")
+            },
+            onBatchSetMuted = { groupId, isMuted ->
+                scope.launch { database.batchSetGroupMuted(groupId, isMuted) }
+            },
+            onResetGroupRingtones = { groupId ->
+                scope.launch { database.resetGroupRingtones(groupId) }
+            },
+            onUpdateGroupMembers = { groupId, selectedChatKeys ->
+                scope.launch {
+                    val currentInGroup = database.getChatKeysInGroup(groupId).toSet()
+                    val toAdd = selectedChatKeys - currentInGroup
+                    val toRemove = currentInGroup - selectedChatKeys.toSet()
+                    if (toAdd.isNotEmpty()) {
+                        database.addChatsToGroup(groupId, toAdd.toList())
+                    }
+                    toRemove.forEach { key ->
+                        database.removeChatFromGroup(groupId, key)
+                    }
+                }
+            },
+            getGroupMemberKeys = { groupId ->
+                database.getChatKeysInGroup(groupId)
+            }
+        )
+    }
+
+    accountToReset?.let { acc ->
+        AlertDialog(
+            onDismissRequest = { accountToReset = null },
+            title = { Text("重設此帳號所有聊天室鈴聲", fontWeight = FontWeight.Bold) },
+            text = { Text("確定要將「${acc.displayName}」底下所有個別聊天室的鈴聲，全部重設為帳號預設鈴聲嗎？") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        scope.launch { database.resetAccountChatRingtones("user_${acc.userId}") }
+                        accountToReset = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("確認重設")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { accountToReset = null }) {
+                    Text("取消")
+                }
+            }
+        )
     }
 }
 
@@ -330,14 +412,18 @@ fun SettingsAndChatsView(
     isRetractKeepEnabled: Boolean,
     chats: List<ChatConversation>,
     detectedAccounts: List<LineAccount>,
+    tagGroups: List<ChatTagGroup>,
     onModeChange: (NotificationMode) -> Unit,
     onGlobalStackToggle: (Boolean) -> Unit,
     onRetractKeepToggle: (Boolean) -> Unit,
+    onOpenTagGroups: () -> Unit,
     onChatStackToggle: (ChatConversation, Boolean) -> Unit,
     onToggleKeepNative: (ChatConversation, Boolean) -> Unit,
     onToggleChatMute: (ChatConversation) -> Unit,
     onPickChatRingtone: (ChatConversation) -> Unit,
+    onResetChatRingtone: (ChatConversation) -> Unit,
     onPickAccountRingtone: (LineAccount) -> Unit,
+    onResetAccountRingtones: (LineAccount) -> Unit,
     onClearChat: (ChatConversation) -> Unit
 ) {
     LazyColumn(
@@ -456,13 +542,24 @@ fun SettingsAndChatsView(
                                     Text(acc.displayName, fontWeight = FontWeight.Medium, fontSize = 13.sp)
                                     Text("User ID: ${acc.userId} | UID: ${acc.uid}", fontSize = 10.sp, color = MaterialTheme.colorScheme.outline)
                                 }
-                                OutlinedButton(
-                                    onClick = { onPickAccountRingtone(acc) },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
-                                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("帳號預設鈴聲", fontSize = 11.sp)
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    OutlinedButton(
+                                        onClick = { onPickAccountRingtone(acc) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("預設鈴聲", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onResetAccountRingtones(acc) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                                    ) {
+                                        Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("重設全部", fontSize = 11.sp)
+                                    }
                                 }
                             }
                         }
@@ -471,7 +568,7 @@ fun SettingsAndChatsView(
             }
         }
 
-        // 聊天室清單標題
+        // 聊天室清單標題 (含標籤群組入口)
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -483,6 +580,14 @@ fun SettingsAndChatsView(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+                OutlinedButton(
+                    onClick = onOpenTagGroups,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Icon(Icons.Default.Label, contentDescription = null, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("群組管理 (${tagGroups.size})", fontSize = 11.sp)
+                }
             }
         }
 
@@ -513,6 +618,7 @@ fun SettingsAndChatsView(
                     onToggleKeepNative = { keep -> onToggleKeepNative(chat, keep) },
                     onToggleMute = { onToggleChatMute(chat) },
                     onPickRingtone = { onPickChatRingtone(chat) },
+                    onResetRingtone = { onResetChatRingtone(chat) },
                     onClear = { onClearChat(chat) }
                 )
             }
@@ -527,6 +633,7 @@ fun ChatCard(
     onToggleKeepNative: (Boolean) -> Unit,
     onToggleMute: () -> Unit,
     onPickRingtone: () -> Unit,
+    onResetRingtone: () -> Unit,
     onClear: () -> Unit
 ) {
     val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -653,7 +760,7 @@ fun ChatCard(
                 }
             }
 
-            // 第二行控制項：自訂鈴聲選擇
+            // 第二行控制項：自訂鈴聲選擇 (含重設按鈕)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -665,17 +772,317 @@ fun ChatCard(
                     color = if (chat.customRingtoneUri != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                 )
 
-                OutlinedButton(
-                    onClick = onPickRingtone,
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (chat.customRingtoneUri != null) "變更鈴聲" else "設定鈴聲", fontSize = 11.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OutlinedButton(
+                        onClick = onPickRingtone,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (chat.customRingtoneUri != null) "變更鈴聲" else "設定鈴聲", fontSize = 11.sp)
+                    }
+
+                    if (chat.customRingtoneUri != null) {
+                        IconButton(
+                            onClick = onResetRingtone,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.RestartAlt,
+                                contentDescription = "重設鈴聲",
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+fun TagGroupManagementDialog(
+    tagGroups: List<ChatTagGroup>,
+    chats: List<ChatConversation>,
+    onDismiss: () -> Unit,
+    onCreateGroup: (name: String) -> Unit,
+    onDeleteGroup: (groupId: Long) -> Unit,
+    onBatchSetRingtone: (groupId: Long) -> Unit,
+    onBatchSetMuted: (groupId: Long, isMuted: Boolean) -> Unit,
+    onResetGroupRingtones: (groupId: Long) -> Unit,
+    onUpdateGroupMembers: (groupId: Long, selectedChatKeys: List<String>) -> Unit,
+    getGroupMemberKeys: suspend (groupId: Long) -> List<String>
+) {
+    val scope = rememberCoroutineScope()
+    var newGroupName by remember { mutableStateOf("") }
+    var editingMembersGroup by remember { mutableStateOf<ChatTagGroup?>(null) }
+    var currentGroupMemberKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var groupToResetRingtone by remember { mutableStateOf<ChatTagGroup?>(null) }
+
+    // 成員勾選管理彈窗
+    if (editingMembersGroup != null) {
+        val group = editingMembersGroup!!
+        AlertDialog(
+            onDismissRequest = { editingMembersGroup = null },
+            title = { Text("管理「${group.name}」成員", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 400.dp)
+                ) {
+                    Text("勾選要加入此群組的聊天室：", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(chats, key = { it.chatKey }) { chat ->
+                            val isChecked = currentGroupMemberKeys.contains(chat.chatKey)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        currentGroupMemberKeys = if (isChecked) {
+                                            currentGroupMemberKeys - chat.chatKey
+                                        } else {
+                                            currentGroupMemberKeys + chat.chatKey
+                                        }
+                                    }
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = isChecked,
+                                    onCheckedChange = { checked ->
+                                        currentGroupMemberKeys = if (checked) {
+                                            currentGroupMemberKeys + chat.chatKey
+                                        } else {
+                                            currentGroupMemberKeys - chat.chatKey
+                                        }
+                                    }
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Column {
+                                    Text(chat.title, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                    val isMain = chat.accountId == "user_0" || chat.accountId == "0"
+                                    Text(
+                                        if (isMain) "主帳號" else "分身 [${chat.accountId}]",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.outline
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    onUpdateGroupMembers(group.groupId, currentGroupMemberKeys.toList())
+                    editingMembersGroup = null
+                }) {
+                    Text("儲存")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingMembersGroup = null }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    // 批量重設鈴聲確認彈窗
+    if (groupToResetRingtone != null) {
+        val grp = groupToResetRingtone!!
+        AlertDialog(
+            onDismissRequest = { groupToResetRingtone = null },
+            title = { Text("重設群組所有鈴聲", fontWeight = FontWeight.Bold) },
+            text = { Text("確定要將「${grp.name}」群組內所有聊天室的自訂鈴聲，全部重設為帳號預設鈴聲嗎？") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onResetGroupRingtones(grp.groupId)
+                        groupToResetRingtone = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("確認重設")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { groupToResetRingtone = null }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("分類群組批量設定", fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // 新增標籤輸入框
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = newGroupName,
+                        onValueChange = { newGroupName = it },
+                        placeholder = { Text("新群組標籤 (如: 工作、家人)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = {
+                            if (newGroupName.isNotBlank()) {
+                                onCreateGroup(newGroupName.trim())
+                                newGroupName = ""
+                            }
+                        },
+                        enabled = newGroupName.isNotBlank(),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text("新增")
+                    }
+                }
+
+                HorizontalDivider()
+
+                if (tagGroups.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("目前尚無任何群組標籤，請於上方輸入名稱建立", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        items(tagGroups, key = { it.groupId }) { group ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    // 標題與成員數 + 刪除
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            Text(group.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                            Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(10.dp)) {
+                                                Text(
+                                                    "${group.memberCount} 個聊天室",
+                                                    fontSize = 10.sp,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                        IconButton(
+                                            onClick = { onDeleteGroup(group.groupId) },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(Icons.Default.Delete, contentDescription = "刪除群組標籤", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.error)
+                                        }
+                                    }
+
+                                    // 第一排按鈕：成員管理 + 批量重設鈴聲
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    val keys = getGroupMemberKeys(group.groupId)
+                                                    currentGroupMemberKeys = keys.toSet()
+                                                    editingMembersGroup = group
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("成員管理", fontSize = 11.sp)
+                                        }
+
+                                        OutlinedButton(
+                                            onClick = { groupToResetRingtone = group },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                                        ) {
+                                            Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("批量重設鈴聲", fontSize = 11.sp)
+                                        }
+                                    }
+
+                                    // 第二排按鈕：批量改鈴聲 + 批量靜音 + 取消靜音
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = { onBatchSetRingtone(group.groupId) },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                                        ) {
+                                            Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(Modifier.width(2.dp))
+                                            Text("批量改鈴聲", fontSize = 10.sp)
+                                        }
+
+                                        OutlinedButton(
+                                            onClick = { onBatchSetMuted(group.groupId, true) },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("批量靜音", fontSize = 10.sp)
+                                        }
+
+                                        OutlinedButton(
+                                            onClick = { onBatchSetMuted(group.groupId, false) },
+                                            modifier = Modifier.weight(1f),
+                                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("取消靜音", fontSize = 10.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("完成")
+            }
+        }
+    )
 }
 
 @Composable

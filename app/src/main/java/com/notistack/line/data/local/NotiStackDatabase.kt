@@ -29,16 +29,22 @@ class NotiStackDatabase private constructor(context: Context) :
     private val _chatsFlow = MutableStateFlow<List<ChatConversation>>(emptyList())
     val chatsFlow: StateFlow<List<ChatConversation>> = _chatsFlow.asStateFlow()
 
+    private val _tagGroupsFlow = MutableStateFlow<List<com.notistack.line.core.model.ChatTagGroup>>(emptyList())
+    val tagGroupsFlow: StateFlow<List<com.notistack.line.core.model.ChatTagGroup>> = _tagGroupsFlow.asStateFlow()
+
     init {
         refreshChats()
+        refreshTagGroups()
     }
 
     companion object {
         private const val DB_NAME = "notistack.db"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
 
         private const val TABLE_CHATS = "chats"
         private const val TABLE_MESSAGES = "messages"
+        private const val TABLE_TAG_GROUPS = "chat_tag_groups"
+        private const val TABLE_TAG_MAPPING = "chat_tag_mapping"
 
         @Volatile
         private var INSTANCE: NotiStackDatabase? = null
@@ -86,6 +92,28 @@ class NotiStackDatabase private constructor(context: Context) :
         )
 
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_messages_chat_key ON $TABLE_MESSAGES(chat_key)")
+
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_TAG_GROUPS (
+                group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                color_hex TEXT NOT NULL DEFAULT '#4CAF50'
+            )
+            """.trimIndent()
+        )
+
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS $TABLE_TAG_MAPPING (
+                chat_key TEXT NOT NULL,
+                group_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_key, group_id),
+                FOREIGN KEY (chat_key) REFERENCES $TABLE_CHATS(chat_key) ON DELETE CASCADE,
+                FOREIGN KEY (group_id) REFERENCES $TABLE_TAG_GROUPS(group_id) ON DELETE CASCADE
+            )
+            """.trimIndent()
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -100,6 +128,32 @@ class NotiStackDatabase private constructor(context: Context) :
         if (oldVersion < 3) {
             try {
                 db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN keep_native_when_disabled INTEGER NOT NULL DEFAULT 1")
+            } catch (e: Exception) {
+                // Ignore if already added
+            }
+        }
+        if (oldVersion < 4) {
+            try {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_TAG_GROUPS (
+                        group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        color_hex TEXT NOT NULL DEFAULT '#4CAF50'
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_TAG_MAPPING (
+                        chat_key TEXT NOT NULL,
+                        group_id INTEGER NOT NULL,
+                        PRIMARY KEY (chat_key, group_id),
+                        FOREIGN KEY (chat_key) REFERENCES $TABLE_CHATS(chat_key) ON DELETE CASCADE,
+                        FOREIGN KEY (group_id) REFERENCES $TABLE_TAG_GROUPS(group_id) ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
             } catch (e: Exception) {
                 // Ignore if already added
             }
@@ -467,5 +521,178 @@ class NotiStackDatabase private constructor(context: Context) :
             }
         }
         _chatsFlow.value = list
+    }
+
+    // ==========================================
+    // Phase 4.2.1 鈴聲多層級重設 API (Reset Ringtone APIs)
+    // ==========================================
+
+    /**
+     * 1. 個別聊天室重設鈴聲為預設 (custom_ringtone_uri = NULL)
+     */
+    suspend fun resetChatRingtone(chatKey: String) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            putNull("custom_ringtone_uri")
+        }
+        db.update(TABLE_CHATS, values, "chat_key = ?", arrayOf(chatKey))
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 2. 該帳號所有聊天室一鍵重設鈴聲為預設
+     */
+    suspend fun resetAccountChatRingtones(accountId: String) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            putNull("custom_ringtone_uri")
+        }
+        db.update(TABLE_CHATS, values, "account_id = ?", arrayOf(accountId))
+        refreshChatsInternal(db)
+    }
+
+    // ==========================================
+    // Phase 4.2.1 自訂標籤群組與批量設定 (Tag Groups & Batch Settings)
+    // ==========================================
+
+    /**
+     * 取得所有自訂分類標籤群組 (含成員數)
+     */
+    suspend fun getAllTagGroups(): List<com.notistack.line.core.model.ChatTagGroup> = mutex.withLock {
+        return@withLock getTagGroupsInternal(readableDatabase)
+    }
+
+    private fun getTagGroupsInternal(db: SQLiteDatabase): List<com.notistack.line.core.model.ChatTagGroup> {
+        val list = mutableListOf<com.notistack.line.core.model.ChatTagGroup>()
+        val sql = """
+            SELECT g.group_id, g.name, g.color_hex, COUNT(m.chat_key) AS member_count
+            FROM $TABLE_TAG_GROUPS g
+            LEFT JOIN $TABLE_TAG_MAPPING m ON g.group_id = m.group_id
+            GROUP BY g.group_id, g.name, g.color_hex
+            ORDER BY g.group_id ASC
+        """.trimIndent()
+        db.rawQuery(sql, null).use { cursor ->
+            while (cursor.moveToNext()) {
+                list.add(
+                    com.notistack.line.core.model.ChatTagGroup(
+                        groupId = cursor.getLong(0),
+                        name = cursor.getString(1),
+                        colorHex = cursor.getString(2),
+                        memberCount = cursor.getInt(3)
+                    )
+                )
+            }
+        }
+        return list
+    }
+
+    /**
+     * 建立自訂標籤群組
+     */
+    suspend fun createTagGroup(name: String, colorHex: String = "#4CAF50"): Long = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put("name", name.trim())
+            put("color_hex", colorHex)
+        }
+        val id = db.insert(TABLE_TAG_GROUPS, null, values)
+        refreshTagGroupsInternal(db)
+        return@withLock id
+    }
+
+    /**
+     * 刪除自訂標籤群組
+     */
+    suspend fun deleteTagGroup(groupId: Long) = mutex.withLock {
+        val db = writableDatabase
+        db.delete(TABLE_TAG_GROUPS, "group_id = ?", arrayOf(groupId.toString()))
+        db.delete(TABLE_TAG_MAPPING, "group_id = ?", arrayOf(groupId.toString()))
+        refreshTagGroupsInternal(db)
+    }
+
+    /**
+     * 將多個聊天室加入指定群組
+     */
+    suspend fun addChatsToGroup(groupId: Long, chatKeys: List<String>) = mutex.withLock {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            chatKeys.forEach { chatKey ->
+                val values = ContentValues().apply {
+                    put("chat_key", chatKey)
+                    put("group_id", groupId)
+                }
+                db.insertWithOnConflict(TABLE_TAG_MAPPING, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        refreshTagGroupsInternal(db)
+    }
+
+    /**
+     * 將特定聊天室自群組移除
+     */
+    suspend fun removeChatFromGroup(groupId: Long, chatKey: String) = mutex.withLock {
+        val db = writableDatabase
+        db.delete(TABLE_TAG_MAPPING, "group_id = ? AND chat_key = ?", arrayOf(groupId.toString(), chatKey))
+        refreshTagGroupsInternal(db)
+    }
+
+    /**
+     * 查詢指定群組內的所有 chatKey 清單
+     */
+    suspend fun getChatKeysInGroup(groupId: Long): List<String> = mutex.withLock {
+        val list = mutableListOf<String>()
+        val db = readableDatabase
+        db.rawQuery("SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?", arrayOf(groupId.toString())).use { cursor ->
+            while (cursor.moveToNext()) {
+                list.add(cursor.getString(0))
+            }
+        }
+        return@withLock list
+    }
+
+    /**
+     * 批量設定群組內所有聊天室的鈴聲 (若 uri == null 則重設回預設)
+     */
+    suspend fun batchSetGroupRingtone(groupId: Long, ringtoneUri: String?) = mutex.withLock {
+        val db = writableDatabase
+        val sql = if (ringtoneUri != null) {
+            "UPDATE $TABLE_CHATS SET custom_ringtone_uri = ? WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)"
+        } else {
+            "UPDATE $TABLE_CHATS SET custom_ringtone_uri = NULL WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)"
+        }
+        val args = if (ringtoneUri != null) arrayOf(ringtoneUri, groupId.toString()) else arrayOf(groupId.toString())
+        db.execSQL(sql, args)
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 批量重設群組內所有聊天室鈴聲為預設
+     */
+    suspend fun resetGroupRingtones(groupId: Long) = batchSetGroupRingtone(groupId, null)
+
+    /**
+     * 批量設定群組內所有聊天室的靜音狀態
+     */
+    suspend fun batchSetGroupMuted(groupId: Long, isMuted: Boolean) = mutex.withLock {
+        val db = writableDatabase
+        val sql = "UPDATE $TABLE_CHATS SET is_muted = ? WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)"
+        db.execSQL(sql, arrayOf(if (isMuted) "1" else "0", groupId.toString()))
+        refreshChatsInternal(db)
+    }
+
+    private fun refreshTagGroups() {
+        scope.launch {
+            mutex.withLock {
+                refreshTagGroupsInternal(readableDatabase)
+            }
+        }
+    }
+
+    private fun refreshTagGroupsInternal(db: SQLiteDatabase) {
+        _tagGroupsFlow.value = getTagGroupsInternal(db)
     }
 }

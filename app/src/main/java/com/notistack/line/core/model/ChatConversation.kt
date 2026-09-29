@@ -30,3 +30,13 @@ data class ChatMessage(
     val retractedTimestamp: Long? = null,
     val rawNotificationKey: String? = null
 )
+
+/**
+ * 自訂分類標籤群組實體 (Phase 4.2.1)
+ */
+data class ChatTagGroup(
+    val groupId: Long = 0,
+    val name: String,
+    val colorHex: String = "#4CAF50",
+    val memberCount: Int = 0
+)
