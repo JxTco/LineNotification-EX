@@ -13,6 +13,7 @@ data class ChatConversation(
     val lastMessageContent: String,
     val unreadCount: Int = 1,
     val customRingtoneUri: String? = null,
+    val customCallRingtoneUri: String? = null,
     val isMuted: Boolean = false,
     val keepNativeWhenDisabled: Boolean = true
 )

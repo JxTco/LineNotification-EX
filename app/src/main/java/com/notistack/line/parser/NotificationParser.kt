@@ -221,6 +221,16 @@ object NotificationParser {
             }
         }
 
+        val isCall = isCallNotification(sbn)
+        if (isCall && rawText.isBlank()) {
+            rawText = "來電通話"
+        }
+        val callActions = if (isCall && notification.actions != null) {
+            notification.actions.toList()
+        } else {
+            emptyList()
+        }
+
         return ParsedChatInfo(
             accountId = accountId,
             chatKey = chatKey,
@@ -235,7 +245,10 @@ object NotificationParser {
             remoteInputResultKey = remoteInputResultKey,
             remoteInputLabel = remoteInputLabel,
             isRetraction = isRetraction,
-            isGroupSummary = isGroupSummary(sbn)
+            isGroupSummary = isGroupSummary(sbn),
+            isCall = isCall,
+            callActions = callActions,
+            fullScreenIntent = notification.fullScreenIntent
         )
     }
 
@@ -298,6 +311,41 @@ object NotificationParser {
             else -> "未知原因 ($reason)"
         }
     }
+
+    /**
+     * 判定是否為 LINE 來電通話通知 (CATEGORY_CALL 或 通話相關特徵)
+     */
+    fun isCallNotification(sbn: StatusBarNotification): Boolean {
+        return try {
+            val notification = sbn.notification ?: return false
+            if (notification.category == Notification.CATEGORY_CALL) {
+                return true
+            }
+            val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null
+            if (channelId?.contains("call", ignoreCase = true) == true || channelId?.contains("voip", ignoreCase = true) == true) {
+                return true
+            }
+            val extras = notification.extras
+            val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+            val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+            val combined = "$title $text"
+            val hasCallKeyword = combined.contains("語音通話") || combined.contains("視訊通話") || combined.contains("來電") ||
+                    combined.contains("Incoming call", ignoreCase = true) || combined.contains("Voice call", ignoreCase = true) || combined.contains("Video call", ignoreCase = true)
+            if (hasCallKeyword) {
+                val actions = notification.actions
+                if (actions != null && actions.any { act ->
+                    val actionTitle = act.title?.toString() ?: ""
+                    actionTitle.contains("接聽") || actionTitle.contains("拒絕") ||
+                            actionTitle.contains("Answer", ignoreCase = true) || actionTitle.contains("Decline", ignoreCase = true)
+                }) {
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
 }
 
 /**
@@ -317,5 +365,8 @@ data class ParsedChatInfo(
     val remoteInputResultKey: String? = null,
     val remoteInputLabel: String? = null,
     val isRetraction: Boolean = false,
-    val isGroupSummary: Boolean = false
+    val isGroupSummary: Boolean = false,
+    val isCall: Boolean = false,
+    val callActions: List<Notification.Action> = emptyList(),
+    val fullScreenIntent: PendingIntent? = null
 )

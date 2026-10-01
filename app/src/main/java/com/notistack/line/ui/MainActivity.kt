@@ -132,9 +132,17 @@ fun MainScreen() {
                 if (target.startsWith("acc_")) {
                     val accId = target.removePrefix("acc_")
                     settingsManager.setAccountRingtoneUri(accId, uriStr)
+                } else if (target.startsWith("chat_call_")) {
+                    val chatKey = target.removePrefix("chat_call_")
+                    scope.launch { database.setChatCallRingtone(chatKey, uriStr) }
                 } else if (target.startsWith("chat_")) {
                     val chatKey = target.removePrefix("chat_")
                     scope.launch { database.setChatRingtone(chatKey, uriStr) }
+                } else if (target.startsWith("group_batch_call_")) {
+                    val groupId = target.removePrefix("group_batch_call_").toLongOrNull()
+                    if (groupId != null) {
+                        scope.launch { database.batchSetGroupCallRingtone(groupId, uriStr) }
+                    }
                 } else if (target.startsWith("group_batch_")) {
                     val groupId = target.removePrefix("group_batch_").toLongOrNull()
                     if (groupId != null) {
@@ -145,10 +153,10 @@ fun MainScreen() {
         }
     }
 
-    val onLaunchPicker: (String?, String, String) -> Unit = { existingUriStr, targetKey, pickerTitle ->
+    val onLaunchPicker: (String?, String, String, Int) -> Unit = { existingUriStr, targetKey, pickerTitle, ringtoneType ->
         activePickerTarget = targetKey
         val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
-            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, ringtoneType)
             putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, pickerTitle)
             putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
             putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
@@ -262,14 +270,20 @@ fun MainScreen() {
                         scope.launch { database.setChatMuted(chat.chatKey, !chat.isMuted) }
                     },
                     onPickChatRingtone = { chat ->
-                        onLaunchPicker(chat.customRingtoneUri, "chat_${chat.chatKey}", "選擇個別聊天室鈴聲")
+                        onLaunchPicker(chat.customRingtoneUri, "chat_${chat.chatKey}", "選擇個別聊天室鈴聲", RingtoneManager.TYPE_NOTIFICATION)
                     },
                     onResetChatRingtone = { chat ->
                         scope.launch { database.resetChatRingtone(chat.chatKey) }
                     },
+                    onPickChatCallRingtone = { chat ->
+                        onLaunchPicker(chat.customCallRingtoneUri, "chat_call_${chat.chatKey}", "選擇個別來電專屬鈴聲", RingtoneManager.TYPE_RINGTONE)
+                    },
+                    onResetChatCallRingtone = { chat ->
+                        scope.launch { database.resetChatCallRingtone(chat.chatKey) }
+                    },
                     onPickAccountRingtone = { account ->
                         val currentUri = settingsManager.getAccountRingtoneUri("user_${account.userId}")
-                        onLaunchPicker(currentUri, "acc_user_${account.userId}", "選擇帳號預設通知鈴聲")
+                        onLaunchPicker(currentUri, "acc_user_${account.userId}", "選擇帳號預設通知鈴聲", RingtoneManager.TYPE_NOTIFICATION)
                     },
                     onResetAccountRingtones = { account ->
                         accountToReset = account
@@ -303,7 +317,7 @@ fun MainScreen() {
                 scope.launch { database.deleteTagGroup(groupId) }
             },
             onBatchSetRingtone = { groupId ->
-                onLaunchPicker(null, "group_batch_$groupId", "選擇群組統一鈴聲")
+                onLaunchPicker(null, "group_batch_$groupId", "選擇群組統一鈴聲", RingtoneManager.TYPE_NOTIFICATION)
             },
             onBatchSetMuted = { groupId, isMuted ->
                 scope.launch { database.batchSetGroupMuted(groupId, isMuted) }
@@ -422,6 +436,8 @@ fun SettingsAndChatsView(
     onToggleChatMute: (ChatConversation) -> Unit,
     onPickChatRingtone: (ChatConversation) -> Unit,
     onResetChatRingtone: (ChatConversation) -> Unit,
+    onPickChatCallRingtone: (ChatConversation) -> Unit,
+    onResetChatCallRingtone: (ChatConversation) -> Unit,
     onPickAccountRingtone: (LineAccount) -> Unit,
     onResetAccountRingtones: (LineAccount) -> Unit,
     onClearChat: (ChatConversation) -> Unit
@@ -499,24 +515,6 @@ fun SettingsAndChatsView(
                         Switch(
                             checked = isGlobalStackEnabled,
                             onCheckedChange = onGlobalStackToggle
-                        )
-                    }
-
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-
-                    // 收回訊息保留開關
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                            Text("保留已收回訊息", fontWeight = FontWeight.Medium, fontSize = 13.sp)
-                            Text("開啟時對方收回仍保留文字並加刪除線；關閉時比照官方同步移除", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
-                        }
-                        Switch(
-                            checked = isRetractKeepEnabled,
-                            onCheckedChange = onRetractKeepToggle
                         )
                     }
                 }
@@ -619,6 +617,8 @@ fun SettingsAndChatsView(
                     onToggleMute = { onToggleChatMute(chat) },
                     onPickRingtone = { onPickChatRingtone(chat) },
                     onResetRingtone = { onResetChatRingtone(chat) },
+                    onPickCallRingtone = { onPickChatCallRingtone(chat) },
+                    onResetCallRingtone = { onResetChatCallRingtone(chat) },
                     onClear = { onClearChat(chat) }
                 )
             }
@@ -634,6 +634,8 @@ fun ChatCard(
     onToggleMute: () -> Unit,
     onPickRingtone: () -> Unit,
     onResetRingtone: () -> Unit,
+    onPickCallRingtone: () -> Unit,
+    onResetCallRingtone: () -> Unit,
     onClear: () -> Unit
 ) {
     val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -656,6 +658,20 @@ fun ChatCard(
                         fontWeight = FontWeight.Bold,
                         fontSize = 15.sp
                     )
+                    // 雙開帳號身分標籤 (Phase 4.2.2 雙開同群組獨立化)
+                    val isPrimaryAccount = chat.accountId == "user_0"
+                    Surface(
+                        color = if (isPrimaryAccount) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.tertiaryContainer,
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = if (isPrimaryAccount) "主帳號" else "分身 (${chat.accountId.removePrefix("user_")})",
+                            fontSize = 10.sp,
+                            color = if (isPrimaryAccount) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onTertiaryContainer,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
                     if (chat.isGroup) {
                         Surface(
                             color = MaterialTheme.colorScheme.secondaryContainer,
@@ -690,12 +706,7 @@ fun ChatCard(
                 Text(text = timeStr, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline)
             }
 
-            Text(
-                text = chat.lastMessageContent,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1
-            )
+            // (已移除 lastMessageContent 訊息內文，大幅精簡卡片高度)
 
             HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
 
@@ -760,7 +771,7 @@ fun ChatCard(
                 }
             }
 
-            // 第二行控制項：自訂鈴聲選擇 (含重設按鈕)
+            // 第二行控制項：自訂訊息鈴聲選擇 (含重設按鈕)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -789,7 +800,45 @@ fun ChatCard(
                         ) {
                             Icon(
                                 Icons.Default.RestartAlt,
-                                contentDescription = "重設鈴聲",
+                                contentDescription = "重設訊息鈴聲",
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 第三行控制項：自訂來電鈴聲選擇 (含重設按鈕) (Phase 4.2.2)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (chat.customCallRingtoneUri != null) "已設定專屬來電" else "來電：依系統預設",
+                    fontSize = 11.sp,
+                    color = if (chat.customCallRingtoneUri != null) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OutlinedButton(
+                        onClick = onPickCallRingtone,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Icon(Icons.Default.Phone, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (chat.customCallRingtoneUri != null) "變更來電" else "設定來電", fontSize = 11.sp)
+                    }
+
+                    if (chat.customCallRingtoneUri != null) {
+                        IconButton(
+                            onClick = onResetCallRingtone,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.RestartAlt,
+                                contentDescription = "重設來電鈴聲",
                                 modifier = Modifier.size(18.dp),
                                 tint = MaterialTheme.colorScheme.error
                             )

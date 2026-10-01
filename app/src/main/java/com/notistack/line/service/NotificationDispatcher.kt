@@ -1,5 +1,6 @@
 package com.notistack.line.service
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -293,6 +294,100 @@ class NotificationDispatcher(private val context: Context) {
         }
 
         return channelId
+    }
+
+    /**
+     * 派發個別聊天室專屬來電通知 (含自訂來電鈴聲通道) (Phase 4.2.2)
+     */
+    fun dispatchCallNotification(
+        chat: ChatConversation,
+        callerTitle: String,
+        content: String,
+        callSoundUriStr: String,
+        contentIntent: PendingIntent?,
+        fullScreenIntent: PendingIntent?,
+        actions: List<Notification.Action>
+    ) {
+        val channelId = getOrCreateDynamicCallChannel("call_${chat.chatKey}", "來電: ${chat.title}", callSoundUriStr)
+        val notificationId = getCallNotificationId(chat.chatKey)
+
+        val builder = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(android.R.drawable.sym_call_incoming)
+            .setContentTitle(callerTitle)
+            .setContentText(content)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setAutoCancel(false)
+
+        if (contentIntent != null) {
+            builder.setContentIntent(contentIntent)
+        }
+        if (fullScreenIntent != null) {
+            builder.setFullScreenIntent(fullScreenIntent, true)
+        }
+
+        // 轉發原生通話 Actions (例如接聽 / 拒絕)
+        actions.forEach { act ->
+            val iconCompat = try {
+                if (act.icon != 0) {
+                    androidx.core.graphics.drawable.IconCompat.createWithResource(context, act.icon)
+                } else null
+            } catch (e: Exception) {
+                null
+            }
+            val actionCompat = NotificationCompat.Action.Builder(
+                iconCompat,
+                act.title,
+                act.actionIntent
+            ).build()
+            builder.addAction(actionCompat)
+        }
+
+        try {
+            notificationManager.notify(notificationId, builder.build())
+        } catch (e: Exception) {
+            android.util.Log.e("NotificationDispatcher", "Failed to dispatch call notification", e)
+        }
+    }
+
+    private fun getOrCreateDynamicCallChannel(prefix: String, name: String, soundUriStr: String): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return STACK_CHANNEL_ID
+
+        val soundUri = Uri.parse(soundUriStr)
+        val channelId = "notistack_${prefix}_${abs(soundUriStr.hashCode())}"
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return STACK_CHANNEL_ID
+
+        if (manager.getNotificationChannel(channelId) == null) {
+            val audioAttributes = AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .build()
+
+            val channel = NotificationChannel(
+                channelId,
+                name,
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                setSound(soundUri, audioAttributes)
+                enableVibration(true)
+            }
+            manager.createNotificationChannel(channel)
+        }
+
+        return channelId
+    }
+
+    /**
+     * 取消指定聊天室的專屬來電通知
+     */
+    fun cancelCallNotification(chatKey: String) {
+        val notificationId = getCallNotificationId(chatKey)
+        notificationManager.cancel(notificationId)
+    }
+
+    fun getCallNotificationId(chatKey: String): Int {
+        return abs(chatKey.hashCode()) + 50000
     }
 
     /**

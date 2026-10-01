@@ -39,7 +39,7 @@ class NotiStackDatabase private constructor(context: Context) :
 
     companion object {
         private const val DB_NAME = "notistack.db"
-        private const val DB_VERSION = 4
+        private const val DB_VERSION = 5
 
         private const val TABLE_CHATS = "chats"
         private const val TABLE_MESSAGES = "messages"
@@ -69,6 +69,7 @@ class NotiStackDatabase private constructor(context: Context) :
                 last_message_content TEXT NOT NULL,
                 unread_count INTEGER NOT NULL DEFAULT 1,
                 custom_ringtone_uri TEXT,
+                custom_call_ringtone_uri TEXT,
                 is_muted INTEGER NOT NULL DEFAULT 0,
                 keep_native_when_disabled INTEGER NOT NULL DEFAULT 1
             )
@@ -158,6 +159,13 @@ class NotiStackDatabase private constructor(context: Context) :
                 // Ignore if already added
             }
         }
+        if (oldVersion < 5) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_CHATS ADD COLUMN custom_call_ringtone_uri TEXT")
+            } catch (e: Exception) {
+                // Ignore if already added
+            }
+        }
     }
 
     /**
@@ -190,19 +198,21 @@ class NotiStackDatabase private constructor(context: Context) :
         var isStackEnabled = true
         var currentUnread = 0
         var customRingtoneUri: String? = null
+        var customCallRingtoneUri: String? = null
         var isMuted = false
         var keepNativeWhenDisabled = true
 
         db.rawQuery(
-            "SELECT is_stack_enabled, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled FROM $TABLE_CHATS WHERE chat_key = ?",
+            "SELECT is_stack_enabled, unread_count, custom_ringtone_uri, custom_call_ringtone_uri, is_muted, keep_native_when_disabled FROM $TABLE_CHATS WHERE chat_key = ?",
             arrayOf(chatKey)
         ).use { cursor ->
             if (cursor.moveToFirst()) {
                 isStackEnabled = cursor.getInt(0) == 1
                 currentUnread = cursor.getInt(1)
                 customRingtoneUri = if (cursor.isNull(2)) null else cursor.getString(2)
-                isMuted = cursor.getInt(3) == 1
-                keepNativeWhenDisabled = cursor.getInt(4) == 1
+                customCallRingtoneUri = if (cursor.isNull(3)) null else cursor.getString(3)
+                isMuted = cursor.getInt(4) == 1
+                keepNativeWhenDisabled = cursor.getInt(5) == 1
             }
         }
 
@@ -217,6 +227,7 @@ class NotiStackDatabase private constructor(context: Context) :
                 lastMessageContent = content,
                 unreadCount = currentUnread,
                 customRingtoneUri = customRingtoneUri,
+                customCallRingtoneUri = customCallRingtoneUri,
                 isMuted = isMuted,
                 keepNativeWhenDisabled = keepNativeWhenDisabled
             )
@@ -246,6 +257,7 @@ class NotiStackDatabase private constructor(context: Context) :
             put("last_message_content", content)
             put("unread_count", newUnread)
             put("custom_ringtone_uri", customRingtoneUri)
+            put("custom_call_ringtone_uri", customCallRingtoneUri)
             put("is_muted", if (isMuted) 1 else 0)
             put("keep_native_when_disabled", if (keepNativeWhenDisabled) 1 else 0)
         }
@@ -263,6 +275,7 @@ class NotiStackDatabase private constructor(context: Context) :
             lastMessageContent = content,
             unreadCount = newUnread,
             customRingtoneUri = customRingtoneUri,
+            customCallRingtoneUri = customCallRingtoneUri,
             isMuted = isMuted,
             keepNativeWhenDisabled = keepNativeWhenDisabled
         )
@@ -462,7 +475,7 @@ class NotiStackDatabase private constructor(context: Context) :
     suspend fun getChat(chatKey: String): ChatConversation? = mutex.withLock {
         val db = readableDatabase
         val query = """
-            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled 
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, custom_call_ringtone_uri, is_muted, keep_native_when_disabled 
             FROM $TABLE_CHATS WHERE chat_key = ?
         """.trimIndent()
 
@@ -478,8 +491,9 @@ class NotiStackDatabase private constructor(context: Context) :
                     lastMessageContent = cursor.getString(6),
                     unreadCount = cursor.getInt(7),
                     customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
-                    isMuted = cursor.getInt(9) == 1,
-                    keepNativeWhenDisabled = cursor.getInt(10) == 1
+                    customCallRingtoneUri = if (cursor.isNull(9)) null else cursor.getString(9),
+                    isMuted = cursor.getInt(10) == 1,
+                    keepNativeWhenDisabled = cursor.getInt(11) == 1
                 )
             }
         }
@@ -497,7 +511,7 @@ class NotiStackDatabase private constructor(context: Context) :
     private fun refreshChatsInternal(db: SQLiteDatabase) {
         val list = mutableListOf<ChatConversation>()
         val query = """
-            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, is_muted, keep_native_when_disabled 
+            SELECT chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, custom_call_ringtone_uri, is_muted, keep_native_when_disabled 
             FROM $TABLE_CHATS ORDER BY last_message_time DESC
         """.trimIndent()
 
@@ -514,8 +528,9 @@ class NotiStackDatabase private constructor(context: Context) :
                         lastMessageContent = cursor.getString(6),
                         unreadCount = cursor.getInt(7),
                         customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
-                        isMuted = cursor.getInt(9) == 1,
-                        keepNativeWhenDisabled = cursor.getInt(10) == 1
+                        customCallRingtoneUri = if (cursor.isNull(9)) null else cursor.getString(9),
+                        isMuted = cursor.getInt(10) == 1,
+                        keepNativeWhenDisabled = cursor.getInt(11) == 1
                     )
                 )
             }
@@ -524,11 +539,32 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     // ==========================================
-    // Phase 4.2.1 鈴聲多層級重設 API (Reset Ringtone APIs)
+    // Phase 4.2.1 / 4.2.2 鈴聲多層級重設 API (Reset Ringtone APIs)
     // ==========================================
 
     /**
-     * 1. 個別聊天室重設鈴聲為預設 (custom_ringtone_uri = NULL)
+     * 設定特定聊天室來電鈴聲 (Phase 4.2.2)
+     */
+    suspend fun setChatCallRingtone(chatKey: String, ringtoneUri: String?) = mutex.withLock {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            if (ringtoneUri != null) {
+                put("custom_call_ringtone_uri", ringtoneUri)
+            } else {
+                putNull("custom_call_ringtone_uri")
+            }
+        }
+        db.update(TABLE_CHATS, values, "chat_key = ?", arrayOf(chatKey))
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 重設個別聊天室來電鈴聲為預設 (custom_call_ringtone_uri = NULL) (Phase 4.2.2)
+     */
+    suspend fun resetChatCallRingtone(chatKey: String) = setChatCallRingtone(chatKey, null)
+
+    /**
+     * 1. 個別聊天室重設訊息鈴聲為預設 (custom_ringtone_uri = NULL)
      */
     suspend fun resetChatRingtone(chatKey: String) = mutex.withLock {
         val db = writableDatabase
@@ -540,12 +576,15 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
-     * 2. 該帳號所有聊天室一鍵重設鈴聲為預設
+     * 2. 該帳號所有聊天室一鍵重設鈴聲為預設 (同時重設訊息與來電鈴聲)
      */
-    suspend fun resetAccountChatRingtones(accountId: String) = mutex.withLock {
+    suspend fun resetAccountChatRingtones(accountId: String, resetCallRingtone: Boolean = true) = mutex.withLock {
         val db = writableDatabase
         val values = ContentValues().apply {
             putNull("custom_ringtone_uri")
+            if (resetCallRingtone) {
+                putNull("custom_call_ringtone_uri")
+            }
         }
         db.update(TABLE_CHATS, values, "account_id = ?", arrayOf(accountId))
         refreshChatsInternal(db)
@@ -670,9 +709,31 @@ class NotiStackDatabase private constructor(context: Context) :
     }
 
     /**
-     * 批量重設群組內所有聊天室鈴聲為預設
+     * 批量設定群組內所有聊天室的來電鈴聲 (Phase 4.2.2)
      */
-    suspend fun resetGroupRingtones(groupId: Long) = batchSetGroupRingtone(groupId, null)
+    suspend fun batchSetGroupCallRingtone(groupId: Long, ringtoneUri: String?) = mutex.withLock {
+        val db = writableDatabase
+        val sql = if (ringtoneUri != null) {
+            "UPDATE $TABLE_CHATS SET custom_call_ringtone_uri = ? WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)"
+        } else {
+            "UPDATE $TABLE_CHATS SET custom_call_ringtone_uri = NULL WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)"
+        }
+        val args = if (ringtoneUri != null) arrayOf(ringtoneUri, groupId.toString()) else arrayOf(groupId.toString())
+        db.execSQL(sql, args)
+        refreshChatsInternal(db)
+    }
+
+    /**
+     * 批量重設群組內所有聊天室鈴聲為預設 (訊息鈴聲與來電鈴聲)
+     */
+    suspend fun resetGroupRingtones(groupId: Long, resetCallRingtone: Boolean = true) = mutex.withLock {
+        val db = writableDatabase
+        db.execSQL("UPDATE $TABLE_CHATS SET custom_ringtone_uri = NULL WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)", arrayOf(groupId.toString()))
+        if (resetCallRingtone) {
+            db.execSQL("UPDATE $TABLE_CHATS SET custom_call_ringtone_uri = NULL WHERE chat_key IN (SELECT chat_key FROM $TABLE_TAG_MAPPING WHERE group_id = ?)", arrayOf(groupId.toString()))
+        }
+        refreshChatsInternal(db)
+    }
 
     /**
      * 批量設定群組內所有聊天室的靜音狀態
