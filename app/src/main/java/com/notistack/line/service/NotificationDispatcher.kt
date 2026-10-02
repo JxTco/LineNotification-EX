@@ -359,17 +359,13 @@ class NotificationDispatcher(private val context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return STACK_CHANNEL_ID
 
         if (manager.getNotificationChannel(channelId) == null) {
-            val audioAttributes = AudioAttributes.Builder()
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                .build()
-
             val channel = NotificationChannel(
                 channelId,
                 name,
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                setSound(soundUri, audioAttributes)
+                // 音訊由 CallRingtonePlayer 循環播放引擎統一掌管，通道音效設為 null 避免雙重發聲衝突
+                setSound(null, null)
                 enableVibration(true)
             }
             manager.createNotificationChannel(channel)

@@ -500,6 +500,76 @@ class NotiStackDatabase private constructor(context: Context) :
         return@withLock null
     }
 
+    /**
+     * 專門為來電通話設計的智慧雙重降級聊天室查詢 (Phase 4.2.3)
+     *
+     * 解決文字訊息聊天室使用 shortcutId (例如 user_0_sc_XXX) 儲存，而語音通話通知缺乏 shortcutId (例如 user_0_dm_小明)
+     * 導致兩者 Key 不一致查不到自訂來電鈴聲的斷層問題。
+     */
+    suspend fun findChatForCaller(accountId: String, chatKey: String, callerName: String): ChatConversation? = mutex.withLock {
+        val db = readableDatabase
+        val cols = "chat_key, account_id, title, is_group, is_stack_enabled, last_message_time, last_message_content, unread_count, custom_ringtone_uri, custom_call_ringtone_uri, is_muted, keep_native_when_disabled"
+
+        // 第 1 步: 嘗試以精準 chatKey 查詢
+        val exactQuery = "SELECT $cols FROM $TABLE_CHATS WHERE chat_key = ? LIMIT 1"
+        var directChat: ChatConversation? = null
+        db.rawQuery(exactQuery, arrayOf(chatKey)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                directChat = ChatConversation(
+                    chatKey = cursor.getString(0),
+                    accountId = cursor.getString(1),
+                    title = cursor.getString(2),
+                    isGroup = cursor.getInt(3) == 1,
+                    isStackEnabled = cursor.getInt(4) == 1,
+                    lastMessageTime = cursor.getLong(5),
+                    lastMessageContent = cursor.getString(6),
+                    unreadCount = cursor.getInt(7),
+                    customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
+                    customCallRingtoneUri = if (cursor.isNull(9)) null else cursor.getString(9),
+                    isMuted = cursor.getInt(10) == 1,
+                    keepNativeWhenDisabled = cursor.getInt(11) == 1
+                )
+            }
+        }
+
+        // 若精確命中且已設定專屬來電鈴聲，直接採用
+        if (directChat != null && !directChat?.customCallRingtoneUri.isNullOrBlank()) {
+            return@withLock directChat
+        }
+
+        // 第 2 步 (跨 Key 降級比對): 若精確 chatKey 未找到或未設鈴聲，以 accountId + 聯絡人姓名查詢已設定鈴聲的聊天室
+        val cleanName = callerName.trim()
+        if (cleanName.isNotBlank()) {
+            val fallbackQuery = """
+                SELECT $cols FROM $TABLE_CHATS 
+                WHERE account_id = ? AND (title = ? OR title LIKE ? OR ? LIKE '%' || title || '%')
+                ORDER BY CASE WHEN custom_call_ringtone_uri IS NOT NULL THEN 0 ELSE 1 END, last_message_time DESC
+                LIMIT 1
+            """.trimIndent()
+
+            db.rawQuery(fallbackQuery, arrayOf(accountId, cleanName, "%$cleanName%", cleanName)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    return@withLock ChatConversation(
+                        chatKey = cursor.getString(0),
+                        accountId = cursor.getString(1),
+                        title = cursor.getString(2),
+                        isGroup = cursor.getInt(3) == 1,
+                        isStackEnabled = cursor.getInt(4) == 1,
+                        lastMessageTime = cursor.getLong(5),
+                        lastMessageContent = cursor.getString(6),
+                        unreadCount = cursor.getInt(7),
+                        customRingtoneUri = if (cursor.isNull(8)) null else cursor.getString(8),
+                        customCallRingtoneUri = if (cursor.isNull(9)) null else cursor.getString(9),
+                        isMuted = cursor.getInt(10) == 1,
+                        keepNativeWhenDisabled = cursor.getInt(11) == 1
+                    )
+                }
+            }
+        }
+
+        return@withLock directChat
+    }
+
     private fun refreshChats() {
         scope.launch {
             mutex.withLock {

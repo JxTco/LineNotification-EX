@@ -111,10 +111,13 @@ class LineNotificationListenerService : NotificationListenerService() {
         Log.d(TAG, "LINE Notification Removed: [Reason $reasonDesc] ${captured.title}")
         NotificationLogRepository.addNotification(captured)
 
-        // 判斷是否為 LINE 來電通話移除 (結束通話或拒接)
+        // 判斷是否為 LINE 來電通話移除 (結束通話或拒接) (Phase 4.2.3)
         val chatInfoForRemoved = NotificationParser.extractChatInfo(sbn)
-        if (chatInfoForRemoved != null && chatInfoForRemoved.isCall) {
-            dispatcher.cancelCallNotification(chatInfoForRemoved.chatKey)
+        if ((chatInfoForRemoved != null && chatInfoForRemoved.isCall) || CallRingtonePlayer.isPlaying()) {
+            CallRingtonePlayer.stopRingtone(this)
+            if (chatInfoForRemoved != null) {
+                dispatcher.cancelCallNotification(chatInfoForRemoved.chatKey)
+            }
         }
 
         // 判斷是否為 LINE 內已讀消除 (REASON_APP_CANCEL == 8)
@@ -145,14 +148,32 @@ class LineNotificationListenerService : NotificationListenerService() {
         val chatInfo = NotificationParser.extractChatInfo(sbn) ?: return
         if (chatInfo.content.isBlank()) return
 
-        // 處理 LINE 語音通話來電通知 (Phase 4.2.2)
+        // 處理 LINE 語音通話來電通知 (Phase 4.2.3 徹底解決來電鈴聲未生效與原鈴聲未被取代問題)
         if (chatInfo.isCall) {
             serviceScope.launch {
                 try {
-                    val currentChat = database.getChat(chatInfo.chatKey)
+                    // 關鍵修正 1: 透過智慧雙重降級匹配尋找聊天室 (解決 ShortcutId 與 DM Key 斷層)
+                    val currentChat = database.findChatForCaller(
+                        accountId = chatInfo.accountId,
+                        chatKey = chatInfo.chatKey,
+                        callerName = chatInfo.senderName
+                    )
                     val callSoundUri = currentChat?.customCallRingtoneUri
-                    if (!callSoundUri.isNullOrBlank()) {
-                        Log.i(TAG, "Custom call ringtone found for ${chatInfo.chatKey}, dispatching call notification")
+
+                    if (currentChat != null && !callSoundUri.isNullOrBlank()) {
+                        Log.i(TAG, "Custom call ringtone found for caller '${chatInfo.senderName}' (ChatKey: ${currentChat.chatKey}), taking over call alert")
+
+                        // 關鍵修正 2: 強制壓制 LINE 原生通話通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
+                        cancelNotification(sbn.key)
+
+                        // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 循環播放專屬音樂)
+                        CallRingtonePlayer.startRingtone(
+                            context = applicationContext,
+                            chatKey = currentChat.chatKey,
+                            ringtoneUriStr = callSoundUri
+                        )
+
+                        // 關鍵修正 4: 派發自訂通話通知 (帶有原生接聽/拒絕 Actions 與 FullScreenIntent)
                         dispatcher.dispatchCallNotification(
                             chat = currentChat,
                             callerTitle = chatInfo.chatTitle,
@@ -162,12 +183,8 @@ class LineNotificationListenerService : NotificationListenerService() {
                             fullScreenIntent = chatInfo.fullScreenIntent,
                             actions = chatInfo.callActions
                         )
-                        // 若處於模式 B，隱藏 LINE 原生通話通知，改由自訂通話通知響鈴
-                        if (settingsManager.notificationMode.value == NotificationMode.MODE_B_HIDE_NATIVE) {
-                            cancelNotification(sbn.key)
-                        }
                     } else {
-                        Log.d(TAG, "No custom call ringtone for ${chatInfo.chatKey}, keeping native call behavior")
+                        Log.d(TAG, "No custom call ringtone for caller '${chatInfo.senderName}', keeping native call behavior")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error handling call notification", e)

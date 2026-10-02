@@ -180,6 +180,42 @@ object NotificationParser {
             }
         }
 
+        // 判定是否為 LINE 來電通話 (Phase 4.2.3)
+        val isCall = isCallNotification(sbn)
+
+        // 智慧通話名稱提取 (Phase 4.2.3):
+        // 在通話通知中，LINE 常將標題設為「LINE語音通話」或「語音通話」，而將發話人名稱置於內文或 EXTRA_CALL_PERSON
+        if (isCall) {
+            val callPerson = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    val person = extras.getParcelable<android.app.Person>("android.callPerson")
+                    person?.name?.toString()?.trim()
+                } else null
+            } catch (e: Exception) {
+                null
+            }
+
+            val genericCallTitles = listOf("LINE", "LINE語音通話", "語音通話", "語音通話來電", "LINE 語音通話", "視訊通話", "LINE視訊通話", "來電")
+            val isTitleGeneric = genericCallTitles.any { rawTitle.equals(it, ignoreCase = true) || rawTitle.startsWith(it, ignoreCase = true) }
+
+            if (!callPerson.isNullOrBlank()) {
+                chatTitle = callPerson
+                senderName = callPerson
+            } else if (isTitleGeneric && rawText.isNotBlank() && !genericCallTitles.any { rawText.equals(it, ignoreCase = true) }) {
+                // Title 是 "LINE語音通話"，Text 是 "小明" -> 提取真正人名
+                chatTitle = rawText
+                senderName = rawText
+            } else if (!isTitleGeneric) {
+                // Title 是 "小明"，Text 是 "LINE語音通話" -> Title 即人名
+                chatTitle = rawTitle
+                senderName = rawTitle
+            }
+
+            if (rawText.isBlank() || isTitleGeneric) {
+                rawText = "語音通話來電"
+            }
+        }
+
         // 建立絕不碰撞的 chatKey (個人聊天室與群組聊天室使用不同前綴)
         val sanitizedTitle = chatTitle.replace(" ", "_").replace("/", "_")
         val chatKey = if (!shortcutId.isNullOrBlank()) {
@@ -221,10 +257,6 @@ object NotificationParser {
             }
         }
 
-        val isCall = isCallNotification(sbn)
-        if (isCall && rawText.isBlank()) {
-            rawText = "來電通話"
-        }
         val callActions = if (isCall && notification.actions != null) {
             notification.actions.toList()
         } else {
@@ -313,34 +345,61 @@ object NotificationParser {
     }
 
     /**
-     * 判定是否為 LINE 來電通話通知 (CATEGORY_CALL 或 通話相關特徵)
+     * 判定是否為 LINE 來電通話通知 (全維度相容判定) (Phase 4.2.3)
      */
     fun isCallNotification(sbn: StatusBarNotification): Boolean {
         return try {
             val notification = sbn.notification ?: return false
+
+            // 1. 標準 CATEGORY_CALL
             if (notification.category == Notification.CATEGORY_CALL) {
                 return true
             }
-            val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null
-            if (channelId?.contains("call", ignoreCase = true) == true || channelId?.contains("voip", ignoreCase = true) == true) {
-                return true
-            }
+
             val extras = notification.extras
             val title = extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
             val text = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
-            val combined = "$title $text"
-            val hasCallKeyword = combined.contains("語音通話") || combined.contains("視訊通話") || combined.contains("來電") ||
-                    combined.contains("Incoming call", ignoreCase = true) || combined.contains("Voice call", ignoreCase = true) || combined.contains("Video call", ignoreCase = true)
-            if (hasCallKeyword) {
-                val actions = notification.actions
-                if (actions != null && actions.any { act ->
-                    val actionTitle = act.title?.toString() ?: ""
-                    actionTitle.contains("接聽") || actionTitle.contains("拒絕") ||
-                            actionTitle.contains("Answer", ignoreCase = true) || actionTitle.contains("Decline", ignoreCase = true)
-                }) {
+            val subText = extras?.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString() ?: ""
+            val tickerText = notification.tickerText?.toString() ?: ""
+            val combined = "$title $text $subText $tickerText"
+
+            // 2. Android 12+ CallStyle 特徵 (EXTRA_CALL_PERSON 或 android.callType)
+            if (extras != null && (extras.containsKey("android.callPerson") || extras.containsKey("android.callType"))) {
+                return true
+            }
+
+            // 3. 通道 ID 特徵
+            val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null
+            if (channelId != null) {
+                val lowerChannel = channelId.lowercase()
+                if (lowerChannel.contains("call") || lowerChannel.contains("voip") || lowerChannel.contains("ring") ||
+                    channelId.contains("通話") || channelId.contains("來電") || channelId.contains("電話")) {
                     return true
                 }
             }
+
+            // 4. 通話關鍵字檢測
+            val hasCallKeyword = combined.contains("語音通話") || combined.contains("視訊通話") || combined.contains("來電") ||
+                    combined.contains("通話中") || combined.contains("Incoming call", ignoreCase = true) ||
+                    combined.contains("Voice call", ignoreCase = true) || combined.contains("Video call", ignoreCase = true)
+
+            // 5. Actions 包含接聽/拒絕/通話/掛斷/Answer/Decline
+            val actions = notification.actions
+            val hasCallAction = actions != null && actions.any { act ->
+                val actionTitle = act.title?.toString() ?: ""
+                actionTitle.contains("接聽") || actionTitle.contains("拒絕") || actionTitle.contains("通話") ||
+                        actionTitle.contains("Answer", ignoreCase = true) || actionTitle.contains("Decline", ignoreCase = true) ||
+                        actionTitle.contains("Hang", ignoreCase = true)
+            }
+
+            if (hasCallAction) {
+                return true
+            }
+
+            if (hasCallKeyword && (notification.fullScreenIntent != null || (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0)) {
+                return true
+            }
+
             false
         } catch (e: Exception) {
             false
