@@ -32,6 +32,7 @@ class LineNotificationListenerService : NotificationListenerService() {
         database = NotiStackDatabase.getInstance(this)
         dispatcher = NotificationDispatcher.getInstance(this)
         settingsManager = SettingsManager.getInstance(this)
+        CallRingtonePlayer.emergencyRestoreVolumes(this)
     }
 
     override fun onListenerConnected() {
@@ -63,6 +64,12 @@ class LineNotificationListenerService : NotificationListenerService() {
         super.onListenerDisconnected()
         instance = null
         NotificationLogRepository.setServiceConnected(false)
+        CallRingtonePlayer.stopRingtone(this)
+        try {
+            requestListenerHints(0)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to restore listener hints on disconnect", e)
+        }
         Log.w(TAG, "NotificationListenerService disconnected.")
     }
 
@@ -111,10 +118,16 @@ class LineNotificationListenerService : NotificationListenerService() {
         Log.d(TAG, "LINE Notification Removed: [Reason $reasonDesc] ${captured.title}")
         NotificationLogRepository.addNotification(captured)
 
-        // 判斷是否為 LINE 來電通話移除 (結束通話或拒接) (Phase 4.2.3)
+        // 判斷是否為 LINE 來電通話移除 (結束通話或拒接) (Phase 4.2.3 & 4.2.4)
         val chatInfoForRemoved = NotificationParser.extractChatInfo(sbn)
         if ((chatInfoForRemoved != null && chatInfoForRemoved.isCall) || CallRingtonePlayer.isPlaying()) {
             CallRingtonePlayer.stopRingtone(this)
+            try {
+                requestListenerHints(0)
+                Log.i(TAG, "Restored listener hints to 0 on call removed")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to restore listener hints", e)
+            }
             if (chatInfoForRemoved != null) {
                 dispatcher.cancelCallNotification(chatInfoForRemoved.chatKey)
             }
@@ -148,7 +161,7 @@ class LineNotificationListenerService : NotificationListenerService() {
         val chatInfo = NotificationParser.extractChatInfo(sbn) ?: return
         if (chatInfo.content.isBlank()) return
 
-        // 處理 LINE 語音通話來電通知 (Phase 4.2.3 徹底解決來電鈴聲未生效與原鈴聲未被取代問題)
+        // 處理 LINE 語音通話來電通知 (Phase 4.2.4 雙鈴聲抑制強化版)
         if (chatInfo.isCall) {
             serviceScope.launch {
                 try {
@@ -163,10 +176,18 @@ class LineNotificationListenerService : NotificationListenerService() {
                     if (currentChat != null && !callSoundUri.isNullOrBlank()) {
                         Log.i(TAG, "Custom call ringtone found for caller '${chatInfo.senderName}' (ChatKey: ${currentChat.chatKey}), taking over call alert")
 
-                        // 關鍵修正 2: 強制壓制 LINE 原生通話通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
+                        // 關鍵修正 2: 嘗試壓制 LINE 原生通話通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
                         cancelNotification(sbn.key)
 
-                        // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 循環播放專屬音樂)
+                        // 關鍵修正 2.5 (Phase 4.2.4): 透過系統提示抑制主機端通話效果 (避免 LINE 原廠鈴聲響起)
+                        try {
+                            requestListenerHints(HINT_HOST_DISABLE_CALL_EFFECTS)
+                            Log.i(TAG, "Requested HINT_HOST_DISABLE_CALL_EFFECTS to suppress host call sounds")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to request listener hints: ${e.message}")
+                        }
+
+                        // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 音量鏡像 + 臨時靜音 STREAM_RING + USAGE_MEDIA 循環播放)
                         CallRingtonePlayer.startRingtone(
                             context = applicationContext,
                             chatKey = currentChat.chatKey,

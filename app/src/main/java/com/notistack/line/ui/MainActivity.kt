@@ -50,7 +50,11 @@ import com.notistack.line.data.preferences.NotificationMode
 import com.notistack.line.data.preferences.SettingsManager
 import com.notistack.line.data.repository.NotificationLogRepository
 import com.notistack.line.parser.NotificationParser
+import com.notistack.line.service.CallRingtonePlayer
 import com.notistack.line.service.NotificationDispatcher
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
@@ -59,6 +63,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CallRingtonePlayer.emergencyRestoreVolumes(this)
         createTestNotificationChannel(this)
 
         setContent {
@@ -171,6 +176,18 @@ fun MainScreen() {
         mutableStateOf(isNotificationListenerEnabled(context))
     }
 
+    val notificationManager = remember {
+        context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    }
+
+    var hasDndPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                notificationManager.isNotificationPolicyAccessGranted
+            } else true
+        )
+    }
+
     var hasPostNotificationPermission by remember {
         mutableStateOf(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -188,9 +205,20 @@ fun MainScreen() {
         hasPostNotificationPermission = isGranted
     }
 
-    DisposableEffect(Unit) {
-        isListenerPermissionGranted = isNotificationListenerEnabled(context)
-        onDispose { }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isListenerPermissionGranted = isNotificationListenerEnabled(context)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    hasDndPermission = notificationManager.isNotificationPolicyAccessGranted
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     Scaffold(
@@ -253,6 +281,12 @@ fun MainScreen() {
                     currentMode = currentMode,
                     isGlobalStackEnabled = isGlobalStackEnabled,
                     isRetractKeepEnabled = isRetractKeepEnabled,
+                    hasDndPermission = hasDndPermission,
+                    onGrantDnd = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                        }
+                    },
                     chats = chats,
                     detectedAccounts = detectedAccounts.values.toList(),
                     tagGroups = tagGroups,
@@ -424,6 +458,8 @@ fun SettingsAndChatsView(
     currentMode: NotificationMode,
     isGlobalStackEnabled: Boolean,
     isRetractKeepEnabled: Boolean,
+    hasDndPermission: Boolean,
+    onGrantDnd: () -> Unit,
     chats: List<ChatConversation>,
     detectedAccounts: List<LineAccount>,
     tagGroups: List<ChatTagGroup>,
@@ -516,6 +552,51 @@ fun SettingsAndChatsView(
                             checked = isGlobalStackEnabled,
                             onCheckedChange = onGlobalStackToggle
                         )
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text("來電防雙鈴聲重疊 (勿擾權限)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                                Surface(
+                                    color = if (hasDndPermission) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        text = if (hasDndPermission) "已啟用" else "未授權",
+                                        color = if (hasDndPermission) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                if (hasDndPermission) "來電時自動臨時靜音 LINE 原廠鈴聲，雙鈴聲不重疊"
+                                else "需開啟勿擾權限以在通話響鈴時靜音 LINE 原廠鈴聲",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        if (!hasDndPermission) {
+                            Button(
+                                onClick = onGrantDnd,
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.padding(start = 8.dp)
+                            ) {
+                                Text("前往授權", fontSize = 11.sp)
+                            }
+                        }
                     }
                 }
             }
