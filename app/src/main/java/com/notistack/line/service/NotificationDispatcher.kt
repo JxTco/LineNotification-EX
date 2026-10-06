@@ -327,7 +327,7 @@ class NotificationDispatcher(private val context: Context) {
             builder.setFullScreenIntent(fullScreenIntent, true)
         }
 
-        // 轉發原生通話 Actions (例如接聽 / 拒絕)
+        // 轉發原生通話 Actions (例如接聽 / 拒絕) + 增強即時停鈴攔截 (Phase 4.2.6)
         actions.forEach { act ->
             val iconCompat = try {
                 if (act.icon != 0) {
@@ -336,13 +336,52 @@ class NotificationDispatcher(private val context: Context) {
             } catch (e: Exception) {
                 null
             }
+            val titleStr = act.title?.toString() ?: ""
+            val isAnswer = titleStr.contains("接聽") || titleStr.contains("Answer", ignoreCase = true)
+            val isDecline = titleStr.contains("拒絕") || titleStr.contains("Decline", ignoreCase = true) || titleStr.contains("Hang", ignoreCase = true)
+
+            val pendingIntentToUse = if (isAnswer || isDecline) {
+                // 透過 CallActionReceiver 包裝，點擊第一時間 (0ms) 停鈴並轉發原廠 Action
+                val interceptIntent = Intent(context, CallActionReceiver::class.java).apply {
+                    action = if (isAnswer) CallActionReceiver.ACTION_CALL_ANSWER else CallActionReceiver.ACTION_CALL_DECLINE
+                    putExtra(CallActionReceiver.EXTRA_CHAT_KEY, chat.chatKey)
+                    putExtra(CallActionReceiver.EXTRA_ORIGINAL_PENDING_INTENT, act.actionIntent)
+                }
+                PendingIntent.getBroadcast(
+                    context,
+                    notificationId + if (isAnswer) 60001 else 60002,
+                    interceptIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                )
+            } else {
+                act.actionIntent
+            }
+
             val actionCompat = NotificationCompat.Action.Builder(
                 iconCompat,
                 act.title,
-                act.actionIntent
+                pendingIntentToUse
             ).build()
             builder.addAction(actionCompat)
         }
+
+        // 新增快速「靜音」Action (無需掛斷即可一鍵靜音與停震) (Phase 4.2.6)
+        val muteIntent = Intent(context, CallActionReceiver::class.java).apply {
+            action = CallActionReceiver.ACTION_CALL_MUTE
+            putExtra(CallActionReceiver.EXTRA_CHAT_KEY, chat.chatKey)
+        }
+        val mutePendingIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + 60003,
+            muteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val muteAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_lock_silent_mode,
+            "靜音",
+            mutePendingIntent
+        ).build()
+        builder.addAction(muteAction)
 
         try {
             notificationManager.notify(notificationId, builder.build())
@@ -364,9 +403,9 @@ class NotificationDispatcher(private val context: Context) {
                 name,
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                // 音訊由 CallRingtonePlayer 循環播放引擎統一掌管，通道音效設為 null 避免雙重發聲衝突
+                // 音訊與震動由 CallRingtonePlayer 循環引擎統一掌管，通道音效與震動設為關閉避免衝突
                 setSound(null, null)
-                enableVibration(true)
+                enableVibration(false)
             }
             manager.createNotificationChannel(channel)
         }

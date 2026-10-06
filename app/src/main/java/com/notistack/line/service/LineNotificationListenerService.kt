@@ -8,6 +8,7 @@ import com.notistack.line.data.local.NotiStackDatabase
 import com.notistack.line.data.preferences.NotificationMode
 import com.notistack.line.data.preferences.SettingsManager
 import com.notistack.line.data.repository.NotificationLogRepository
+import com.notistack.line.parser.CallState
 import com.notistack.line.parser.MessageDeduplicator
 import com.notistack.line.parser.NotificationParser
 import kotlinx.coroutines.CoroutineScope
@@ -111,9 +112,10 @@ class LineNotificationListenerService : NotificationListenerService() {
         Log.d(TAG, "LINE Notification Removed: [Reason $reasonDesc] ${captured.title}")
         NotificationLogRepository.addNotification(captured)
 
-        // 判斷是否為 LINE 來電通話移除 (結束通話或拒接) (Phase 4.2.3)
+        // 判斷是否為 LINE 來電通話移除 (結束通話、已接聽或拒接) (Phase 4.2.3 & 4.2.6)
         val chatInfoForRemoved = NotificationParser.extractChatInfo(sbn)
-        if ((chatInfoForRemoved != null && chatInfoForRemoved.isCall) || CallRingtonePlayer.isPlaying()) {
+        if ((chatInfoForRemoved != null && chatInfoForRemoved.callState != CallState.NONE) || CallRingtonePlayer.isPlaying()) {
+            Log.i(TAG, "LINE call notification removed, stopping ringtone and cancelling call notification.")
             CallRingtonePlayer.stopRingtone(this)
             if (chatInfoForRemoved != null) {
                 dispatcher.cancelCallNotification(chatInfoForRemoved.chatKey)
@@ -148,8 +150,17 @@ class LineNotificationListenerService : NotificationListenerService() {
         val chatInfo = NotificationParser.extractChatInfo(sbn) ?: return
         if (chatInfo.content.isBlank()) return
 
-        // 處理 LINE 語音通話來電通知 (Phase 4.2.3 徹底解決來電鈴聲未生效與原鈴聲未被取代問題)
-        if (chatInfo.isCall) {
+        // 處理 LINE 語音通話狀態 (Phase 4.2.3 & 4.2.6)
+        // 情況 1: 通話已接通 (ONGOING) 或已結束 (ENDED) -> 立即停鈴並消除來電卡片，絕不壓制原生通話中通知
+        if (chatInfo.callState == CallState.ONGOING || chatInfo.callState == CallState.ENDED) {
+            Log.i(TAG, "Detected ongoing/ended call for caller '${chatInfo.senderName}' (State: ${chatInfo.callState}), stopping ringtone immediately.")
+            CallRingtonePlayer.stopRingtone(this)
+            dispatcher.cancelCallNotification(chatInfo.chatKey)
+            return
+        }
+
+        // 情況 2: 來電響鈴中 (INCOMING) -> 壓制原生來電通知並啟動自訂專屬鈴聲
+        if (chatInfo.callState == CallState.INCOMING) {
             serviceScope.launch {
                 try {
                     // 關鍵修正 1: 透過智慧雙重降級匹配尋找聊天室 (解決 ShortcutId 與 DM Key 斷層)
@@ -175,17 +186,17 @@ class LineNotificationListenerService : NotificationListenerService() {
 
                         Log.i(TAG, "Custom call ringtone found for caller '${chatInfo.senderName}' (ChatKey: ${chatToUse.chatKey}), taking over call alert")
 
-                        // 關鍵修正 2: 強制壓制 LINE 原生通話通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
+                        // 關鍵修正 2: 強制壓制 LINE 原生來電通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
                         cancelNotification(sbn.key)
 
-                        // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 循環播放專屬音樂)
+                        // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 啟用 MediaSession 硬體音量鍵接管 + 循環播放與震動)
                         CallRingtonePlayer.startRingtone(
                             context = applicationContext,
                             chatKey = chatToUse.chatKey,
                             ringtoneUriStr = callSoundUri
                         )
 
-                        // 關鍵修正 4: 派發自訂通話通知 (帶有原生接聽/拒絕 Actions 與 FullScreenIntent)
+                        // 關鍵修正 4: 派發自訂通話通知 (帶有原生接聽/拒絕/一鍵靜音 Actions 與 FullScreenIntent)
                         dispatcher.dispatchCallNotification(
                             chat = chatToUse,
                             callerTitle = chatInfo.chatTitle,

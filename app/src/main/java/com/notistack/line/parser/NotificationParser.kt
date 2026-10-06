@@ -180,12 +180,13 @@ object NotificationParser {
             }
         }
 
-        // 判定是否為 LINE 來電通話 (Phase 4.2.3)
-        val isCall = isCallNotification(sbn)
+        // 判定 LINE 通話狀態 (Phase 4.2.3 & 4.2.6)
+        val callState = extractCallState(sbn)
+        val isCall = (callState == CallState.INCOMING)
 
-        // 智慧通話名稱提取 (Phase 4.2.3):
+        // 智慧通話名稱提取 (Phase 4.2.3 & 4.2.6):
         // 在通話通知中，LINE 常將標題設為「LINE語音通話」或「語音通話」，而將發話人名稱置於內文或 EXTRA_CALL_PERSON
-        if (isCall) {
+        if (callState != CallState.NONE) {
             val callPerson = try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val person = extras.getParcelable<android.app.Person>("android.callPerson")
@@ -212,7 +213,12 @@ object NotificationParser {
             }
 
             if (rawText.isBlank() || isTitleGeneric) {
-                rawText = "語音通話來電"
+                rawText = when (callState) {
+                    CallState.INCOMING -> "語音通話來電"
+                    CallState.ONGOING -> "通話進行中"
+                    CallState.ENDED -> "通話已結束"
+                    CallState.NONE -> rawText
+                }
             }
         }
 
@@ -257,7 +263,7 @@ object NotificationParser {
             }
         }
 
-        val callActions = if (isCall && notification.actions != null) {
+        val callActions = if (callState != CallState.NONE && notification.actions != null) {
             notification.actions.toList()
         } else {
             emptyList()
@@ -279,6 +285,7 @@ object NotificationParser {
             isRetraction = isRetraction,
             isGroupSummary = isGroupSummary(sbn),
             isCall = isCall,
+            callState = callState,
             callActions = callActions,
             fullScreenIntent = notification.fullScreenIntent
         )
@@ -345,15 +352,23 @@ object NotificationParser {
     }
 
     /**
-     * 判定是否為 LINE 來電通話通知 (全維度相容判定) (Phase 4.2.3)
+     * 判定是否為 LINE 來電通話通知 (Phase 4.2.3 & 4.2.6)
      */
     fun isCallNotification(sbn: StatusBarNotification): Boolean {
-        return try {
-            val notification = sbn.notification ?: return false
+        return extractCallState(sbn) == CallState.INCOMING
+    }
 
-            // 1. 標準 CATEGORY_CALL
-            if (notification.category == Notification.CATEGORY_CALL) {
-                return true
+    /**
+     * 精準判定 LINE 通話狀態 (來電中 / 通話進行中 / 通話結束) (Phase 4.2.6)
+     */
+    fun extractCallState(sbn: StatusBarNotification): CallState {
+        return try {
+            val notification = sbn.notification ?: return CallState.NONE
+
+            val category = notification.category
+            // 1. 標準 CATEGORY_MISSED_CALL 直接判定為通話已結束
+            if (category == Notification.CATEGORY_MISSED_CALL) {
+                return CallState.ENDED
             }
 
             val extras = notification.extras
@@ -363,48 +378,77 @@ object NotificationParser {
             val tickerText = notification.tickerText?.toString() ?: ""
             val combined = "$title $text $subText $tickerText"
 
-            // 2. Android 12+ CallStyle 特徵 (EXTRA_CALL_PERSON 或 android.callType)
-            if (extras != null && (extras.containsKey("android.callPerson") || extras.containsKey("android.callType"))) {
-                return true
+            // 2. 結束關鍵字判定
+            val endedKeywords = listOf("未接來電", "Missed call", "通話已結束", "取消通話", "已取消", "Call ended", "通話結束")
+            if (endedKeywords.any { combined.contains(it, ignoreCase = true) }) {
+                return CallState.ENDED
             }
 
-            // 3. 通道 ID 特徵
-            val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null
-            if (channelId != null) {
-                val lowerChannel = channelId.lowercase()
-                if (lowerChannel.contains("call") || lowerChannel.contains("voip") || lowerChannel.contains("ring") ||
-                    channelId.contains("通話") || channelId.contains("來電") || channelId.contains("電話")) {
-                    return true
-                }
+            // 3. Android 12+ CallStyle 特徵 (CALL_TYPE_INCOMING = 1, CALL_TYPE_ONGOING = 2)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && extras != null) {
+                val callType = extras.getInt("android.callType", -1)
+                if (callType == 2) return CallState.ONGOING
+                if (callType == 1) return CallState.INCOMING
             }
 
-            // 4. 通話關鍵字檢測
-            val hasCallKeyword = combined.contains("語音通話") || combined.contains("視訊通話") || combined.contains("來電") ||
-                    combined.contains("通話中") || combined.contains("Incoming call", ignoreCase = true) ||
-                    combined.contains("Voice call", ignoreCase = true) || combined.contains("Video call", ignoreCase = true)
-
-            // 5. Actions 包含接聽/拒絕/通話/掛斷/Answer/Decline
+            // 4. 分析 Notification Actions 意圖 (接聽、拒絕、掛斷)
             val actions = notification.actions
-            val hasCallAction = actions != null && actions.any { act ->
+            val hasAnswerAction = actions != null && actions.any { act ->
                 val actionTitle = act.title?.toString() ?: ""
-                actionTitle.contains("接聽") || actionTitle.contains("拒絕") || actionTitle.contains("通話") ||
-                        actionTitle.contains("Answer", ignoreCase = true) || actionTitle.contains("Decline", ignoreCase = true) ||
-                        actionTitle.contains("Hang", ignoreCase = true)
+                actionTitle.contains("接聽") || actionTitle.contains("Answer", ignoreCase = true)
+            }
+            val hasDeclineAction = actions != null && actions.any { act ->
+                val actionTitle = act.title?.toString() ?: ""
+                actionTitle.contains("拒絕") || actionTitle.contains("Decline", ignoreCase = true)
+            }
+            val hasHangupAction = actions != null && actions.any { act ->
+                val actionTitle = act.title?.toString() ?: ""
+                actionTitle.contains("掛斷") || actionTitle.contains("切斷") || actionTitle.contains("Hang", ignoreCase = true) || actionTitle.contains("End call", ignoreCase = true)
             }
 
-            if (hasCallAction) {
-                return true
+            // 5. 判斷是否為通話進行中 (ONGOING)
+            // 特徵：只有掛斷按鈕而無接聽按鈕，或者文字包含「通話中」、「00:XX」等計時模式
+            val ongoingKeywords = listOf("通話中", "通話進行中", "LINE通話中", "語音通話中", "視訊通話中", "Ongoing call", "In call", "通話時間")
+            val hasOngoingKeyword = ongoingKeywords.any { combined.contains(it, ignoreCase = true) }
+            val hasTimerPattern = Regex("""\b\d{2}:\d{2}\b""").containsMatchIn(combined)
+
+            if ((hasHangupAction && !hasAnswerAction) || hasOngoingKeyword || hasTimerPattern) {
+                return CallState.ONGOING
             }
 
-            if (hasCallKeyword && (notification.fullScreenIntent != null || (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0)) {
-                return true
+            // 6. 判斷是否為來電響鈴中 (INCOMING)
+            if (hasAnswerAction || (hasDeclineAction && !hasHangupAction)) {
+                return CallState.INCOMING
             }
 
-            false
+            val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) notification.channelId else null
+            val isCallChannel = channelId != null && (
+                channelId.lowercase().contains("call") || channelId.lowercase().contains("voip") ||
+                channelId.contains("通話") || channelId.contains("來電")
+            )
+            val isCallCategory = category == Notification.CATEGORY_CALL
+            val hasIncomingKeyword = combined.contains("來電") || combined.contains("Incoming call", ignoreCase = true) ||
+                    combined.contains("語音通話") || combined.contains("視訊通話")
+
+            if ((isCallCategory || isCallChannel || (extras != null && extras.containsKey("android.callPerson"))) && hasIncomingKeyword) {
+                return CallState.INCOMING
+            }
+
+            CallState.NONE
         } catch (e: Exception) {
-            false
+            CallState.NONE
         }
     }
+}
+
+/**
+ * LINE 通話狀態 (Phase 4.2.6)
+ */
+enum class CallState {
+    NONE,       // 非通話事件
+    INCOMING,   // 來電響鈴中 (待接聽)
+    ONGOING,    // 通話進行中 (已接聽/進行中)
+    ENDED       // 未接來電或通話已結束
 }
 
 /**
@@ -426,6 +470,7 @@ data class ParsedChatInfo(
     val isRetraction: Boolean = false,
     val isGroupSummary: Boolean = false,
     val isCall: Boolean = false,
+    val callState: CallState = CallState.NONE,
     val callActions: List<Notification.Action> = emptyList(),
     val fullScreenIntent: PendingIntent? = null
 )

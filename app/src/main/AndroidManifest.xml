@@ -60,6 +60,17 @@
             </intent-filter>
         </receiver>
 
+        <!-- 來電動作 (接聽/拒絕/靜音) 攔截與轉發廣播接收器 (Phase 4.2.6) -->
+        <receiver
+            android:name=".service.CallActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.notistack.line.ACTION_CALL_ANSWER" />
+                <action android:name="com.notistack.line.ACTION_CALL_DECLINE" />
+                <action android:name="com.notistack.line.ACTION_CALL_MUTE" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>
