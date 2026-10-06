@@ -31,6 +31,7 @@ class SettingsManager(context: Context) {
         private const val KEY_GLOBAL_STACK = "key_global_stack_enabled"
         private const val KEY_RETRACT_KEEP = "key_retract_keep_enabled"
         private const val KEY_ACCOUNT_RINGTONE_PREFIX = "key_acc_ringtone_"
+        private const val KEY_ACCOUNT_CALL_RINGTONE_PREFIX = "key_acc_call_ringtone_"
         private const val KEY_ACCOUNT_VIBRATION_PREFIX = "key_acc_vibrate_"
 
         @Volatile
@@ -81,6 +82,14 @@ class SettingsManager(context: Context) {
 
     fun setAccountRingtoneUri(accountId: String, ringtoneUri: String?) {
         prefs.edit().putString(KEY_ACCOUNT_RINGTONE_PREFIX + accountId, ringtoneUri).apply()
+    }
+
+    fun getAccountCallRingtoneUri(accountId: String): String? {
+        return prefs.getString(KEY_ACCOUNT_CALL_RINGTONE_PREFIX + accountId, null)
+    }
+
+    fun setAccountCallRingtoneUri(accountId: String, ringtoneUri: String?) {
+        prefs.edit().putString(KEY_ACCOUNT_CALL_RINGTONE_PREFIX + accountId, ringtoneUri).apply()
     }
 
     fun isAccountVibrationEnabled(accountId: String): Boolean {

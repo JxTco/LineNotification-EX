@@ -158,10 +158,22 @@ class LineNotificationListenerService : NotificationListenerService() {
                         chatKey = chatInfo.chatKey,
                         callerName = chatInfo.senderName
                     )
+                    // 優先順序 1: 個別聊天室專屬來電鈴聲 -> 優先順序 2: 帳號預設來電鈴聲
                     val callSoundUri = currentChat?.customCallRingtoneUri
+                        ?: settingsManager.getAccountCallRingtoneUri(chatInfo.accountId)
 
-                    if (currentChat != null && !callSoundUri.isNullOrBlank()) {
-                        Log.i(TAG, "Custom call ringtone found for caller '${chatInfo.senderName}' (ChatKey: ${currentChat.chatKey}), taking over call alert")
+                    if (!callSoundUri.isNullOrBlank()) {
+                        val chatToUse = currentChat ?: com.notistack.line.core.model.ChatConversation(
+                            chatKey = chatInfo.chatKey,
+                            accountId = chatInfo.accountId,
+                            title = chatInfo.chatTitle,
+                            isGroup = chatInfo.isGroup,
+                            lastMessageTime = chatInfo.timestamp,
+                            lastMessageContent = chatInfo.content,
+                            customCallRingtoneUri = callSoundUri
+                        )
+
+                        Log.i(TAG, "Custom call ringtone found for caller '${chatInfo.senderName}' (ChatKey: ${chatToUse.chatKey}), taking over call alert")
 
                         // 關鍵修正 2: 強制壓制 LINE 原生通話通知 (切斷 LINE 原廠預設鈴聲，不論模式 A 或 B)
                         cancelNotification(sbn.key)
@@ -169,13 +181,13 @@ class LineNotificationListenerService : NotificationListenerService() {
                         // 關鍵修正 3: 啟動專屬循環播放器 (取得 AudioFocus + 循環播放專屬音樂)
                         CallRingtonePlayer.startRingtone(
                             context = applicationContext,
-                            chatKey = currentChat.chatKey,
+                            chatKey = chatToUse.chatKey,
                             ringtoneUriStr = callSoundUri
                         )
 
                         // 關鍵修正 4: 派發自訂通話通知 (帶有原生接聽/拒絕 Actions 與 FullScreenIntent)
                         dispatcher.dispatchCallNotification(
-                            chat = currentChat,
+                            chat = chatToUse,
                             callerTitle = chatInfo.chatTitle,
                             content = chatInfo.content,
                             callSoundUriStr = callSoundUri,

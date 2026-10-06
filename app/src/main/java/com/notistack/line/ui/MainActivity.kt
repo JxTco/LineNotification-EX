@@ -129,7 +129,10 @@ fun MainScreen() {
             val uriStr = uri?.toString()
             val target = activePickerTarget
             if (target != null) {
-                if (target.startsWith("acc_")) {
+                if (target.startsWith("acc_call_")) {
+                    val accId = target.removePrefix("acc_call_")
+                    settingsManager.setAccountCallRingtoneUri(accId, uriStr)
+                } else if (target.startsWith("acc_")) {
                     val accId = target.removePrefix("acc_")
                     settingsManager.setAccountRingtoneUri(accId, uriStr)
                 } else if (target.startsWith("chat_call_")) {
@@ -285,6 +288,10 @@ fun MainScreen() {
                         val currentUri = settingsManager.getAccountRingtoneUri("user_${account.userId}")
                         onLaunchPicker(currentUri, "acc_user_${account.userId}", "選擇帳號預設通知鈴聲", RingtoneManager.TYPE_NOTIFICATION)
                     },
+                    onPickAccountCallRingtone = { account ->
+                        val currentUri = settingsManager.getAccountCallRingtoneUri("user_${account.userId}")
+                        onLaunchPicker(currentUri, "acc_call_user_${account.userId}", "選擇帳號預設來電鈴聲", RingtoneManager.TYPE_RINGTONE)
+                    },
                     onResetAccountRingtones = { account ->
                         accountToReset = account
                     },
@@ -347,12 +354,16 @@ fun MainScreen() {
     accountToReset?.let { acc ->
         AlertDialog(
             onDismissRequest = { accountToReset = null },
-            title = { Text("重設此帳號所有聊天室鈴聲", fontWeight = FontWeight.Bold) },
-            text = { Text("確定要將「${acc.displayName}」底下所有個別聊天室的鈴聲，全部重設為帳號預設鈴聲嗎？") },
+            title = { Text("重設此帳號所有鈴聲", fontWeight = FontWeight.Bold) },
+            text = { Text("確定要將「${acc.displayName}」底下所有個別聊天室的鈴聲，以及此帳號的預設通知/來電鈴聲全部重設嗎？") },
             confirmButton = {
                 Button(
                     onClick = {
-                        scope.launch { database.resetAccountChatRingtones("user_${acc.userId}") }
+                        scope.launch {
+                            database.resetAccountChatRingtones("user_${acc.userId}")
+                            settingsManager.setAccountRingtoneUri("user_${acc.userId}", null)
+                            settingsManager.setAccountCallRingtoneUri("user_${acc.userId}", null)
+                        }
                         accountToReset = null
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
@@ -439,6 +450,7 @@ fun SettingsAndChatsView(
     onPickChatCallRingtone: (ChatConversation) -> Unit,
     onResetChatCallRingtone: (ChatConversation) -> Unit,
     onPickAccountRingtone: (LineAccount) -> Unit,
+    onPickAccountCallRingtone: (LineAccount) -> Unit,
     onResetAccountRingtones: (LineAccount) -> Unit,
     onClearChat: (ChatConversation) -> Unit
 ) {
@@ -536,27 +548,35 @@ fun SettingsAndChatsView(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(acc.displayName, fontWeight = FontWeight.Medium, fontSize = 13.sp)
                                     Text("User ID: ${acc.userId} | UID: ${acc.uid}", fontSize = 10.sp, color = MaterialTheme.colorScheme.outline)
                                 }
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                     OutlinedButton(
                                         onClick = { onPickAccountRingtone(acc) },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
                                     ) {
                                         Icon(Icons.Default.MusicNote, contentDescription = null, modifier = Modifier.size(14.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("預設鈴聲", fontSize = 11.sp)
+                                        Spacer(Modifier.width(2.dp))
+                                        Text("訊息鈴聲", fontSize = 11.sp)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { onPickAccountCallRingtone(acc) },
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(Icons.Default.Call, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(2.dp))
+                                        Text("來電鈴聲", fontSize = 11.sp)
                                     }
                                     OutlinedButton(
                                         onClick = { onResetAccountRingtones(acc) },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
                                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                                     ) {
                                         Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(14.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("重設全部", fontSize = 11.sp)
+                                        Spacer(Modifier.width(2.dp))
+                                        Text("重設", fontSize = 11.sp)
                                     }
                                 }
                             }
